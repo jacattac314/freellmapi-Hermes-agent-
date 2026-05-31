@@ -7,7 +7,9 @@ import healthRouter from './routes/health';
 import modelsRouter from './routes/models';
 import chatRouter from './routes/chat';
 import adminRouter from './routes/admin';
+import keysRouter from './routes/keys';
 import { errorHandler } from './middleware/error';
+import { pruneUsage } from './services/ratelimit';
 
 const app = express();
 
@@ -19,6 +21,7 @@ app.use(healthRouter);
 app.use(modelsRouter);
 app.use(chatRouter);
 app.use(adminRouter);
+app.use(keysRouter);
 
 // Global error handler
 app.use(errorHandler);
@@ -33,6 +36,9 @@ async function start() {
     console.error(err);
     process.exit(1);
   }
+
+  // Prune stale rate-limit usage rows every hour
+  setInterval(() => { pruneUsage().catch(() => {}); }, 60 * 60 * 1000);
 
   const server = app.listen(env.PORT, () => {
     console.log(`\n🚀  Free LLM API Router running at http://localhost:${env.PORT}`);

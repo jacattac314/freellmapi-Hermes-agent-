@@ -9,9 +9,14 @@ const router = Router();
 const MODELS_CONFIG_PATH = path.resolve(__dirname, '../config/models.json');
 
 // GET /admin/providers — list all providers + their status
-router.get('/admin/providers', (_req, res) => {
-  const cooldowns = getCooldowns();
-  res.json(getProviderStatuses(cooldowns));
+router.get('/admin/providers', async (_req, res) => {
+  try {
+    const cooldowns = getCooldowns();
+    const statuses = await getProviderStatuses(cooldowns);
+    res.json(statuses);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 // DELETE /admin/cooldowns/:provider — manually clear a cooldown
