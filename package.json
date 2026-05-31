@@ -1,0 +1,20 @@
+{
+  "name": "freellmapi-hermes-agent",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,dash -c blue,green \"npm run dev -w apps/api\" \"npm run dev -w apps/dashboard\"",
+    "build": "npm run build -w @freellmapi/shared && npm run build -w apps/api && npm run build -w apps/dashboard",
+    "test": "npm run test -w @freellmapi/api",
+    "setup": "npm run build -w @freellmapi/shared && DATABASE_URL=file:./apps/api/dev.db npx prisma db push --schema=apps/api/prisma/schema.prisma --skip-generate",
+    "db:push": "DATABASE_URL=file:./apps/api/dev.db npx prisma db push --schema=apps/api/prisma/schema.prisma",
+    "db:studio": "DATABASE_URL=file:./apps/api/dev.db npx prisma studio --schema=apps/api/prisma/schema.prisma"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
