@@ -4,6 +4,7 @@ export interface LogRequestParams {
   provider: string;
   model: string;
   modelAlias: string | null;
+  keyId?: number | null;
   status: 'success' | 'error' | 'timeout' | 'rate_limited';
   latencyMs: number;
   promptTokens: number;

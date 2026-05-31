@@ -1,0 +1,44 @@
+services:
+  api:
+    build: .
+    ports:
+      - "${PORT:-3001}:3001"
+    volumes:
+      # Persist the SQLite database across container restarts
+      - ./data:/app/apps/api/data
+    environment:
+      DATABASE_URL: file:./data/prod.db
+      NODE_ENV: production
+      PORT: 3001
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      FREE_LLM_API_KEY: ${FREE_LLM_API_KEY:-}
+      # Provider env-var fallbacks (optional — use dashboard to manage keys instead)
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      SAMBANOVA_API_KEY: ${SAMBANOVA_API_KEY:-}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+
+  # Optional: run the dashboard as a separate Vite dev server (dev mode only)
+  dashboard:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm run dev -w apps/dashboard"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    environment:
+      VITE_API_URL: http://localhost:3001
+    profiles:
+      - dev

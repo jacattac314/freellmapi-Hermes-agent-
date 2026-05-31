@@ -46,4 +46,14 @@ export const api = {
       headers: headers(),
       body: JSON.stringify(body),
     }),
+
+  // Key management
+  listKeys: () => get<any[]>('/admin/keys'),
+  addKey: (data: { platform: string; apiKey: string; label?: string; baseUrl?: string }) =>
+    fetch('/admin/keys', { method: 'POST', headers: headers(), body: JSON.stringify(data) }).then((r) => r.json()),
+  updateKey: (id: number, data: { enabled?: boolean; label?: string; status?: string }) =>
+    fetch(`/admin/keys/${id}`, { method: 'PATCH', headers: headers(), body: JSON.stringify(data) }).then((r) => r.json()),
+  deleteKey: (id: number) => del<{ ok: boolean }>(`/admin/keys/${id}`),
+  validateKey: (id: number) =>
+    fetch(`/admin/keys/${id}/validate`, { method: 'POST', headers: headers() }).then((r) => r.json()),
 };

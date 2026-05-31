@@ -12,6 +12,7 @@ model RequestLog {
   provider         String
   model            String
   modelAlias       String?
+  keyId            Int?     // which key was used (null = env-var key)
   status           String   // success | error | timeout | rate_limited
   latencyMs        Int
   promptTokens     Int      @default(0)
@@ -23,4 +24,49 @@ model RequestLog {
   @@index([provider])
   @@index([createdAt])
   @@index([status])
+}
+
+// Encrypted provider API keys (AES-256-GCM)
+model ProviderKey {
+  id            Int       @id @default(autoincrement())
+  platform      String    // provider name: groq, openrouter, etc.
+  label         String    @default("")
+  encryptedKey  String
+  iv            String
+  authTag       String
+  status        String    @default("active") // active | invalid | exhausted
+  enabled       Boolean   @default(true)
+  baseUrl       String?   // for custom/Ollama providers
+  createdAt     DateTime  @default(now())
+  lastCheckedAt DateTime?
+
+  @@index([platform, enabled])
+}
+
+// Escalating cooldown state per platform+key (persists across restarts)
+model RateLimitCooldown {
+  id          Int    @id @default(autoincrement())
+  platform    String
+  keyId       Int    // -1 = env-var key
+  expiresAtMs BigInt
+
+  @@unique([platform, keyId])
+}
+
+// Sliding-window usage counters per platform+key (kept for 24h)
+model RateLimitUsage {
+  id          Int    @id @default(autoincrement())
+  platform    String
+  keyId       Int
+  kind        String // request | tokens
+  tokens      Int    @default(0)
+  createdAtMs BigInt
+
+  @@index([platform, keyId, kind, createdAtMs])
+}
+
+// Key-value store for app settings (unified API key, etc.)
+model Settings {
+  key   String @id
+  value String
 }

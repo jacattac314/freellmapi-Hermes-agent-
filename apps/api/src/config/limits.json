@@ -1,0 +1,16 @@
+{
+  "groq":        { "rpm": 30,  "rpd": 14400, "tpm": 6000,    "tpd": 500000  },
+  "cerebras":    { "rpm": 60,  "rpd": null,  "tpm": 60000,   "tpd": null    },
+  "sambanova":   { "rpm": 60,  "rpd": null,  "tpm": 100000,  "tpd": null    },
+  "openrouter":  { "rpm": 20,  "rpd": 200,   "tpm": null,    "tpd": null    },
+  "mistral":     { "rpm": 1,   "rpd": null,  "tpm": 500000,  "tpd": null    },
+  "gemini":      { "rpm": 15,  "rpd": 1500,  "tpm": 1000000, "tpd": null    },
+  "nvidia":      { "rpm": 40,  "rpd": null,  "tpm": null,    "tpd": null    },
+  "together":    { "rpm": 60,  "rpd": null,  "tpm": 600000,  "tpd": null    },
+  "fireworks":   { "rpm": 60,  "rpd": null,  "tpm": 600000,  "tpd": null    },
+  "github":      { "rpm": 15,  "rpd": null,  "tpm": 8000,    "tpd": null    },
+  "cohere":      { "rpm": 5,   "rpd": 1000,  "tpm": 10000,   "tpd": null    },
+  "huggingface": { "rpm": 30,  "rpd": null,  "tpm": 32000,   "tpd": null    },
+  "cloudflare":  { "rpm": 300, "rpd": null,  "tpm": null,    "tpd": null    },
+  "ollama":      { "rpm": null,"rpd": null,  "tpm": null,    "tpd": null    }
+}

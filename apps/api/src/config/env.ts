@@ -12,10 +12,15 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   DATABASE_URL: z.string().default('file:./dev.db'),
 
+  // Required for encrypting provider API keys stored in the database.
+  // Generate with: openssl rand -hex 32
+  ENCRYPTION_KEY: z.string().optional(),
+
   // Optional bearer token for /v1 endpoints
   FREE_LLM_API_KEY: z.string().optional(),
 
-  // Provider keys — all optional; missing keys disable the provider
+  // Fallback provider keys via env vars (used when no DB key exists for a provider).
+  // Keys stored in the DB via the dashboard take precedence.
   OPENROUTER_API_KEY: z.string().optional(),
   GROQ_API_KEY: z.string().optional(),
   MISTRAL_API_KEY: z.string().optional(),
@@ -23,10 +28,16 @@ const envSchema = z.object({
   GITHUB_TOKEN: z.string().optional(),
   CLOUDFLARE_API_TOKEN: z.string().optional(),
   CLOUDFLARE_ACCOUNT_ID: z.string().optional(),
+  CEREBRAS_API_KEY: z.string().optional(),
+  SAMBANOVA_API_KEY: z.string().optional(),
+  COHERE_API_KEY: z.string().optional(),
+  NVIDIA_API_KEY: z.string().optional(),
+  TOGETHER_API_KEY: z.string().optional(),
+  FIREWORKS_API_KEY: z.string().optional(),
+  HF_TOKEN: z.string().optional(),
 
   // Router tunables
   PROVIDER_TIMEOUT_MS: z.string().default('30000').transform(Number),
-  PROVIDER_COOLDOWN_MS: z.string().default('60000').transform(Number),
 });
 
 function parseEnv() {

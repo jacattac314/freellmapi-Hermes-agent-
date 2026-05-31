@@ -1,8 +1,9 @@
 import { Outlet, NavLink } from 'react-router-dom';
-import { Activity, Cpu, BarChart2, MessageSquare, Zap } from 'lucide-react';
+import { Activity, Cpu, BarChart2, MessageSquare, Zap, Key } from 'lucide-react';
 
 const navItems = [
   { to: '/providers', icon: Cpu, label: 'Providers' },
+  { to: '/keys', icon: Key, label: 'API Keys' },
   { to: '/models', icon: Zap, label: 'Model Aliases' },
   { to: '/usage', icon: BarChart2, label: 'Usage' },
   { to: '/playground', icon: MessageSquare, label: 'Playground' },
