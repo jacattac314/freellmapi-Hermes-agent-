@@ -1,0 +1,28 @@
+{
+  "fast": [
+    { "provider": "groq", "model": "llama-3.1-8b-instant" },
+    { "provider": "openrouter", "model": "meta-llama/llama-3.1-8b-instruct:free" },
+    { "provider": "gemini", "model": "gemini-2.0-flash" }
+  ],
+  "smart": [
+    { "provider": "openrouter", "model": "deepseek/deepseek-chat-v3-0324:free" },
+    { "provider": "mistral", "model": "mistral-large-latest" },
+    { "provider": "groq", "model": "llama-3.3-70b-versatile" },
+    { "provider": "gemini", "model": "gemini-2.0-flash" }
+  ],
+  "code": [
+    { "provider": "openrouter", "model": "qwen/qwen-2.5-coder-32b-instruct:free" },
+    { "provider": "groq", "model": "qwen-qwq-32b" },
+    { "provider": "openrouter", "model": "deepseek/deepseek-r1:free" }
+  ],
+  "vision": [
+    { "provider": "gemini", "model": "gemini-2.0-flash" },
+    { "provider": "openrouter", "model": "google/gemini-flash-1.5:free" }
+  ],
+  "free": [
+    { "provider": "groq", "model": "llama-3.1-8b-instant" },
+    { "provider": "openrouter", "model": "meta-llama/llama-3.1-8b-instruct:free" },
+    { "provider": "gemini", "model": "gemini-2.0-flash" },
+    { "provider": "github", "model": "gpt-4o-mini" }
+  ]
+}

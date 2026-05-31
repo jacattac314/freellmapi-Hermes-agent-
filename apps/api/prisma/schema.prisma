@@ -1,0 +1,26 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model RequestLog {
+  id               Int      @id @default(autoincrement())
+  provider         String
+  model            String
+  modelAlias       String?
+  status           String   // success | error | timeout | rate_limited
+  latencyMs        Int
+  promptTokens     Int      @default(0)
+  completionTokens Int      @default(0)
+  totalTokens      Int      @default(0)
+  errorMessage     String?
+  createdAt        DateTime @default(now())
+
+  @@index([provider])
+  @@index([createdAt])
+  @@index([status])
+}
