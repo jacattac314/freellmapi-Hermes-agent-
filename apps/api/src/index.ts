@@ -9,6 +9,7 @@ import chatRouter from './routes/chat';
 import adminRouter from './routes/admin';
 import keysRouter from './routes/keys';
 import { errorHandler } from './middleware/error';
+import { apiKeyAuth } from './middleware/auth';
 import { pruneUsage } from './services/ratelimit';
 
 const app = express();
@@ -20,6 +21,7 @@ app.use(express.json({ limit: '4mb' }));
 app.use(healthRouter);
 app.use(modelsRouter);
 app.use(chatRouter);
+app.use('/admin', apiKeyAuth);
 app.use(adminRouter);
 app.use(keysRouter);
 

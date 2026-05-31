@@ -4,11 +4,22 @@ import { env } from '../config/env';
 import { getProviderByName, getEnabledProviders, getKeysForProvider } from '../providers/registry';
 import { ProviderError, type LLMProvider } from '../providers/types';
 import { logRequest } from '../db/usage';
-import { setCooldown, isOnCooldown, clearCooldown, recordRequest } from '../services/ratelimit';
+import { setCooldown, isOnCooldown, clearCooldown, recordRequest, recordTokens, canUseTokens } from '../services/ratelimit';
 import modelAliases from '../config/models.json';
+import providerLimits from '../config/limits.json';
 import type { ServerResponse } from 'http';
 
 type ModelAliasMap = Record<string, Array<{ provider: string; model: string }>>;
+type ProviderLimitRow = { rpm: number | null; rpd: number | null; tpm: number | null; tpd: number | null };
+const limits = providerLimits as Record<string, ProviderLimitRow>;
+
+function estimateTokens(req: ChatCompletionRequest): number {
+  const chars = req.messages.reduce(
+    (sum, m) => sum + (typeof m.content === 'string' ? m.content.length : 0),
+    0,
+  );
+  return Math.ceil(chars / 3.5) + (req.max_tokens ?? 1024);
+}
 
 // Provider-level cooldown map (legacy — kept for /admin/providers display)
 // Per-key cooldowns live in the ratelimit service.
@@ -100,9 +111,17 @@ export async function routeRequest(
       continue;
     }
 
+    const providerLimit = limits[provider.name] ?? { rpm: null, rpd: null, tpm: null, tpd: null };
+    const estimated = estimateTokens(req);
+
     for (const { keyId, apiKey, baseUrl } of keys) {
       if (await isOnCooldown(provider.name, keyId)) {
         errors.push(`${provider.name}[key:${keyId}]: in cooldown`);
+        continue;
+      }
+
+      if (!canUseTokens(provider.name, keyId, estimated, providerLimit)) {
+        errors.push(`${provider.name}[key:${keyId}]: token budget exhausted`);
         continue;
       }
 
@@ -170,6 +189,7 @@ export async function routeRequest(
         const usage = normalized.usage;
 
         recordRequest(provider.name, keyId);
+        recordTokens(provider.name, keyId, usage?.total_tokens ?? 0);
 
         await logRequest({
           provider: provider.name, model, modelAlias: modelAlias ?? null, keyId,

@@ -22,6 +22,9 @@ const COOLDOWN_DURATIONS = [2 * MINUTE, 10 * MINUTE, HOUR, DAY];
 // In-memory sliding windows: `platform:keyId:rpm|rpd` → timestamps[]
 const requestWindows = new Map<string, number[]>();
 
+// In-memory token sliding windows: `platform:keyId:tpm|tpd` → {ts, tokens}[]
+const tokenWindows = new Map<string, Array<{ ts: number; tokens: number }>>();
+
 // In-memory cooldown hit counts for escalation: `platform:keyId` → timestamps[]
 const cooldownHits = new Map<string, number[]>();
 
@@ -54,10 +57,54 @@ export function recordRequest(platform: string, keyId: number): void {
   const now = Date.now();
   getWindow(`${platform}:${keyId}:rpm`).push(now);
   getWindow(`${platform}:${keyId}:rpd`).push(now);
-  // Fire-and-forget DB persistence
   prisma.rateLimitUsage.create({
     data: { platform, keyId, kind: 'request', tokens: 0, createdAtMs: BigInt(now) },
   }).catch(() => {});
+}
+
+// --- Token sliding windows ---
+
+function getTokenWindow(key: string): Array<{ ts: number; tokens: number }> {
+  if (!tokenWindows.has(key)) tokenWindows.set(key, []);
+  return tokenWindows.get(key)!;
+}
+
+function pruneTokenWindow(key: string, windowMs: number): Array<{ ts: number; tokens: number }> {
+  const cutoff = Date.now() - windowMs;
+  const w = getTokenWindow(key).filter((e) => e.ts > cutoff);
+  tokenWindows.set(key, w);
+  return w;
+}
+
+/** Sum tokens used within windowMs for a platform+key */
+export function tokenCount(platform: string, keyId: number, windowMs: number): number {
+  const type = windowMs === MINUTE ? 'tpm' : 'tpd';
+  return pruneTokenWindow(`${platform}:${keyId}:${type}`, windowMs)
+    .reduce((sum, e) => sum + e.tokens, 0);
+}
+
+/** Record actual tokens consumed after a successful request */
+export function recordTokens(platform: string, keyId: number, tokens: number): void {
+  if (tokens <= 0) return;
+  const now = Date.now();
+  const entry = { ts: now, tokens };
+  getTokenWindow(`${platform}:${keyId}:tpm`).push(entry);
+  getTokenWindow(`${platform}:${keyId}:tpd`).push(entry);
+  prisma.rateLimitUsage.create({
+    data: { platform, keyId, kind: 'tokens', tokens, createdAtMs: BigInt(now) },
+  }).catch(() => {});
+}
+
+/** Check whether a key has enough token budget for an estimated request */
+export function canUseTokens(
+  platform: string,
+  keyId: number,
+  estimatedTokens: number,
+  limits: { tpm: number | null; tpd: number | null },
+): boolean {
+  if (limits.tpm !== null && tokenCount(platform, keyId, MINUTE) + estimatedTokens > limits.tpm) return false;
+  if (limits.tpd !== null && tokenCount(platform, keyId, DAY) + estimatedTokens > limits.tpd) return false;
+  return true;
 }
 
 /** Check whether a key can make a new request given its rate limits */
@@ -142,6 +189,7 @@ export function clearAllCooldownsForTest(): void {
   cooldownCache.clear();
   cooldownHits.clear();
   requestWindows.clear();
+  tokenWindows.clear();
 }
 
 /** Purge rate_limit_usage rows older than 24h (call periodically) */
