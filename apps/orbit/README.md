@@ -17,6 +17,10 @@ that runs on demo data and loads its libraries from jsDelivr:
 node apps/orbit/build-standalone.mjs     # → apps/orbit/dist/orbit-demo.html
 ```
 
+To host it with live data (e.g. to open on a phone), deploy `apps/orbit` to Vercel:
+`vercel.json` builds the static page with `build-vercel.mjs`, and `api/data/[key].js`
+proxies the data sources with edge caching (CelesTrak cached 2 h, per its policy).
+
 No API keys needed. Data is fetched by the local server and cached in `apps/orbit/.cache/`.
 
 ## What you're looking at
