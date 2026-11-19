@@ -1,6 +1,6 @@
 // Builds a Vercel deployment of the app with live data:
 //   static page + worker (libraries from jsDelivr) → written to outDir
-//   api/data/[key].js (committed alongside) — fetches CelesTrak / NOAA and lets
+//   api/feed/[key].js (committed alongside) — fetches CelesTrak / NOAA and lets
 //   Vercel's CDN cache each response (CelesTrak: 2 h, per its polling policy).
 //
 //   node apps/orbit/build-vercel.mjs [outDir]   → apps/orbit/dist/vercel/

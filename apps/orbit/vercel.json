@@ -4,5 +4,15 @@
   "installCommand": "true",
   "buildCommand": "node build-vercel.mjs",
   "outputDirectory": "dist/vercel",
-  "functions": { "api/data/[key].js": { "maxDuration": 30 } }
+  "functions": {
+    "api/feed/[key].js": {
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/data/:key",
+      "destination": "/api/feed/:key"
+    }
+  ]
 }
