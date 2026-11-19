@@ -499,9 +499,9 @@ const STOPS = [
   { name: 'Surface & aurora', dist: 1.9, desc: 'Close in: the aurora oval (NOAA OVATION forecast, ~30–90 min ahead), the ISS and the dense low-orbit shell. Night side is unlit.' },
   { name: 'Low Earth orbit', dist: 3.4, desc: 'LEO (below ~2,000 km): Starlink, OneWeb, the ISS and most of the catalog. Objects lap the planet every ~90–120 minutes.' },
   { name: 'Navigation orbits', dist: 10, desc: 'Medium Earth orbit (~20,000 km): GPS, Galileo, GLONASS and BeiDou, each orbiting about twice a day.' },
-  { name: 'Geostationary belt', dist: 19, desc: 'GEO ring at 35,786 km: communications and weather satellites that orbit once per day, so they hover over one longitude.' },
+  { name: 'Geostationary belt', dist: 19, desc: 'GEO ring at 35,786 km. The cyan shell is the magnetopause, where Earth\'s magnetic field holds off the solar wind; it shrinks when wind pressure rises.' },
   { name: 'Earth–Moon', dist: 150, desc: 'The Moon at ~384,000 km (60 Earth radii). Satellites collapse into a speck at this scale. Moon position: low-precision ephemeris.' },
-  { name: 'Sun–Earth L1', dist: 800, desc: '1.5 million km sunward: ACE and DSCOVR measure the solar wind here, giving 15–60 minutes of warning before it reaches Earth.' },
+  { name: 'Sun–Earth L1', dist: 800, desc: '1.5 million km sunward: ACE and DSCOVR measure the solar wind here. The stream shows the last hour of those measurements on its way to Earth, coloured by speed.' },
 ];
 const slider = $('scale-slider');
 $('scale-ticks').innerHTML = STOPS.map((s, i) => `<span data-i="${i}" style="left:${(i / (STOPS.length - 1)) * 100}%">${s.name}</span>`).join('');
@@ -576,6 +576,7 @@ function updateLabelVisibility(dist = camera.position.length()) {
   l1Label.visible = on && dist > 80;
   sunLabel.visible = on && dist > 80;
   auroraPoints.visible = $('layer-aurora').checked && dist < 12;
+  mpLabel.visible = on && dist > 8 && dist < 120;
 }
 
 // ------------------------------------------------------------ aurora layer
@@ -609,6 +610,7 @@ async function pollWeather() {
   await Promise.all(['wind', 'mag', 'xray'].map(async (k) => {
     try { wx[k] = { data: await fetchJson(k), error: null }; } catch (e) { wx[k] = { ...(wx[k] || {}), error: String(e.message || e) }; }
   }));
+  rebuildWindSeries();
 }
 
 async function pollAurora() {
@@ -672,7 +674,7 @@ function renderWeather() {
     const t = parseTime(a['Observation Time']);
     rows.push(`<dt>${dot(Date.now() - t, 20 * 60000)}Aurora</dt><dd>forecast<small>model run from ${ago(t)} data · not an observation</small></dd>`);
   }
-  $('wx').innerHTML = rows.join('');
+  $('wx').innerHTML = rows.join('') + windRows().join('');
 }
 
 function renderFreshness() {
@@ -735,6 +737,202 @@ function renderIss() {
   }).join('');
 }
 
+// ------------------------------------------------------- solar wind stream
+// Particles flow from L1 toward Earth. A particle is a parcel of plasma that
+// passed L1 `age` seconds ago; it carries the measurement from that moment and
+// sits where that measured speed has carried it. So the stream is the last
+// ~hour of real L1 data laid out in space, fast wind overtaking slow wind piles
+// up into a front, and arrival times follow each parcel's own speed. The
+// animation can be sped up (the real trip takes ~40–90 min).
+// Around Earth the flow is pushed aside by the bow shock / magnetopause, whose
+// size comes from the Shue et al. (1998) model driven by the wind hitting now.
+const L1_KM = 1.5e6;
+const WIND_N = 3500;
+const WIND_R = 28; // half-width of the drawn stream, Earth radii
+const windA = new Float32Array(WIND_N), windU = new Float32Array(WIND_N), windV = new Float32Array(WIND_N), windK = new Float32Array(WIND_N);
+for (let i = 0; i < WIND_N; i++) {
+  windA[i] = -1; // seeded on first update
+  const a = Math.random() * Math.PI * 2, r = Math.sqrt(Math.random()) * WIND_R;
+  windU[i] = r * Math.cos(a); windV[i] = r * Math.sin(a); windK[i] = Math.random();
+}
+const windGeom = new THREE.BufferGeometry();
+windGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(WIND_N * 3), 3).setUsage(THREE.DynamicDrawUsage));
+windGeom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(WIND_N * 3), 3).setUsage(THREE.DynamicDrawUsage));
+const windPoints = new THREE.Points(windGeom, new THREE.PointsMaterial({
+  size: 2.4, sizeAttenuation: false, vertexColors: true, map: dotTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+}));
+windPoints.frustumCulled = false;
+scene.add(windPoints);
+
+let windSeries = []; // [{t, v, n, bz}] ascending
+function rebuildWindSeries() {
+  const byMin = new Map();
+  const put = (row, fields) => {
+    const t = parseTime(row.time_tag).getTime();
+    if (!Number.isFinite(t)) return;
+    const k = Math.round(t / 60000);
+    const e = byMin.get(k) || { t: k * 60000 };
+    for (const [src, dst] of fields) {
+      const v = Number(row[src]);
+      if (row[src] == null || !Number.isFinite(v)) continue;
+      if (e[dst] === undefined || row.active !== false) e[dst] = v; // prefer the active spacecraft
+    }
+    byMin.set(k, e);
+  };
+  for (const r of Array.isArray(wx.wind?.data) ? wx.wind.data : []) put(r, [['proton_speed', 'v'], ['proton_density', 'n']]);
+  for (const r of Array.isArray(wx.mag?.data) ? wx.mag.data : []) put(r, [['bz_gsm', 'bz']]);
+  const rows = [...byMin.values()].sort((a, b) => a.t - b.t);
+  // carry values forward over gaps so every minute has a full record
+  let last = { v: 400, n: 5, bz: 0 };
+  windSeries = rows.map((r) => (last = { t: r.t, v: r.v ?? last.v, n: r.n ?? last.n, bz: r.bz ?? last.bz }))
+    .filter((r) => r.v > 100);
+}
+function windAt(t) {
+  const s = windSeries;
+  if (!s.length) return null;
+  if (t <= s[0].t) return s[0];
+  let lo = 0, hi = s.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (s[mid].t <= t) lo = mid; else hi = mid - 1; }
+  return s[lo];
+}
+const travelMs = (v) => (L1_KM / v) * 1000;
+
+// Shue et al. 1998 magnetopause: standoff r0 (Earth radii) and flaring α.
+function magnetopause(v, n, bz) {
+  const pd = 1.6726e-6 * n * v * v; // dynamic pressure, nPa
+  const r0 = (10.22 + 1.29 * Math.tanh(0.184 * (bz + 8.14))) * Math.pow(pd, -1 / 6.6);
+  const alpha = (0.58 - 0.007 * bz) * (1 + 0.024 * Math.log(pd));
+  return { pd, r0, alpha };
+}
+const shueR = (mp, cosT) => mp.r0 * Math.pow(2 / Math.max(1 + cosT, 0.04), mp.alpha);
+
+let mp = { pd: 2, r0: 10, alpha: 0.58 }; // what the wind arriving now produces
+let mpShown = null;
+const mpGroup = new THREE.Group();
+scene.add(mpGroup);
+const mpLabel = makeLabel('Magnetopause');
+mpGroup.add(mpLabel);
+function rebuildMagnetopause() {
+  if (mpShown && Math.abs(mpShown.r0 - mp.r0) < 0.05 && Math.abs(mpShown.alpha - mp.alpha) < 0.005) return;
+  mpShown = { ...mp };
+  for (const c of [...mpGroup.children]) if (c !== mpLabel) { mpGroup.remove(c); c.geometry.dispose(); }
+  const shape = (scale) => {
+    const pts = [];
+    for (let deg = 0; deg <= 105; deg += 5) {
+      const th = THREE.MathUtils.degToRad(deg), r = Math.min(shueR(mp, Math.cos(th)) * scale, 40);
+      pts.push(new THREE.Vector2(r * Math.sin(th), r * Math.cos(th)));
+    }
+    return new THREE.LatheGeometry(pts, 36);
+  };
+  const mk = (geo, color, opacity, wire) => new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    color, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false, wireframe: wire,
+  }));
+  const mpGeo = shape(1);
+  mpGroup.add(mk(mpGeo, 0x4dd0e1, 0.06, false), mk(mpGeo.clone(), 0x4dd0e1, 0.05, true));
+  mpGroup.add(mk(shape(1.3), 0xffcc80, 0.025, false)); // bow shock, roughly 1.3× standoff
+  mpLabel.position.set(0, mp.r0, 0);
+}
+function orientMagnetopause() {
+  mpGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), sunDir);
+}
+
+let windTimeScale = 60;
+const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), wp = new THREE.Vector3();
+function speedColour(v, out) {
+  // 300 km/s slow → cool blue, ~450 typical → white, 700+ fast stream / CME → orange-red
+  const t = THREE.MathUtils.clamp((v - 300) / 400, 0, 1);
+  if (t < 0.4) out.setRGB(0.35 + t * 1.6, 0.6 + t, 1);
+  else out.setRGB(1, 1 - (t - 0.4) * 1.3, 1 - (t - 0.4) * 1.6);
+  return out;
+}
+const wc = new THREE.Color();
+function updateWind(dt, now) {
+  const latest = windSeries[windSeries.length - 1];
+  const on = $('layer-wind').checked && !!latest;
+  windPoints.visible = on;
+  mpGroup.visible = on;
+  if (!on) return;
+  windStatus = windTimeline(now);
+  const arriving = windStatus.arriving;
+  if (arriving) { mp = magnetopause(arriving.v, Math.max(arriving.n, 0.1), arriving.bz); rebuildMagnetopause(); }
+  orientMagnetopause();
+
+  e1.crossVectors(sunDir, new THREE.Vector3(0, 1, 0));
+  if (e1.lengthSq() < 1e-6) e1.set(1, 0, 0);
+  e1.normalize(); e2.crossVectors(sunDir, e1).normalize();
+
+  const L1 = L1_KM / RE_KM;
+  const maxAge = (1.3 * L1_KM) / 300; // s: long enough for slow wind to pass Earth
+  const pos = windGeom.attributes.position.array, col = windGeom.attributes.color.array;
+  for (let i = 0; i < WIND_N; i++) {
+    if (windA[i] < 0) windA[i] = Math.random() * 1.3 * (L1_KM / latest.v);
+    let a = windA[i] + dt * windTimeScale;
+    let m = windAt(now - a * 1000);
+    let s = (a * m.v) / L1_KM; // fraction of the L1→Earth distance covered
+    if (s > 1.3 || a > maxAge) { a = 0; m = latest; s = 0; }
+    windA[i] = a;
+    const k = i * 3;
+    if (windK[i] > m.n / 14) { // denser wind → more of the stream is filled
+      pos[k] = pos[k + 1] = pos[k + 2] = 0; continue;
+    }
+    const x = (1 - s) * L1;
+    wp.copy(sunDir).multiplyScalar(x).addScaledVector(e1, windU[i]).addScaledVector(e2, windV[i]);
+    const r = wp.length();
+    const bs = Math.min(1.3 * shueR(mp, x / r), 60);
+    if (r < bs) wp.multiplyScalar(bs / r); // deflected around the bow shock
+    pos[k] = wp.x; pos[k + 1] = wp.y; pos[k + 2] = wp.z;
+    speedColour(m.v, wc);
+    const fade = s > 1 ? Math.max(0, 1 - (s - 1) / 0.3) : Math.min(1, s * 20 + 0.05);
+    col[k] = wc.r * fade; col[k + 1] = wc.g * fade; col[k + 2] = wc.b * fade;
+  }
+  windGeom.attributes.position.needsUpdate = true;
+  windGeom.attributes.color.needsUpdate = true;
+}
+
+// Who is where on the L1→Earth trip right now, using each parcel's own speed.
+let windStatus = { arriving: null, nextFront: null, latest: null };
+function windTimeline(now) {
+  const s = windSeries;
+  const latest = s[s.length - 1];
+  let arriving = null, front = null;
+  for (let i = s.length - 1; i >= 0; i--) { // newest → oldest
+    const r = s[i], eta = r.t + travelMs(r.v);
+    if (eta <= now) { arriving = r; break; }
+  }
+  arriving ??= s[0];
+  const pA = 1.6726e-6 * arriving.n * arriving.v * arriving.v;
+  let best = Infinity;
+  for (const r of s) { // a notably faster or harder-pushing parcel still in transit
+    const eta = r.t + travelMs(r.v);
+    if (eta <= now || eta >= best) continue;
+    const p = 1.6726e-6 * r.n * r.v * r.v;
+    if (r.v >= arriving.v + 75 || p >= 2 * pA) { best = eta; front = { ...r, eta, p }; }
+  }
+  return { arriving, nextFront: front, latest };
+}
+$('wind-speed').addEventListener('change', (e) => { windTimeScale = Number(e.target.value); });
+
+function hhmm(t) { return new Date(t).toISOString().slice(11, 16); }
+function windRows() {
+  const { arriving, nextFront, latest } = windStatus;
+  if (!latest || !arriving) return [];
+  const now = Date.now();
+  const eta = latest.t + travelMs(latest.v);
+  const mins = (t) => Math.max(0, Math.round((t - now) / 60000));
+  const press = mp.pd < 1 ? 'low' : mp.pd < 3 ? 'normal' : mp.pd < 6 ? 'elevated' : 'high';
+  const rows = [];
+  rows.push(`<dt>Hitting Earth now</dt><dd>${Math.round(arriving.v)} km/s · ${arriving.n.toFixed(1)} p/cm³<small>passed L1 at ${hhmm(arriving.t)} UTC, ${Math.round((now - arriving.t) / 60000)} min ago</small></dd>`);
+  if (nextFront) {
+    rows.push(`<dt class="south">Faster wind incoming</dt><dd class="south">${hhmm(nextFront.eta)} UTC<small>${Math.round(nextFront.v)} km/s · ${nextFront.p.toFixed(1)} nPa · arrives in ${mins(nextFront.eta)} min</small></dd>`);
+  }
+  rows.push(`<dt>Wind measured now</dt><dd>arrives ${hhmm(eta)} UTC<small>${Math.round(latest.v)} km/s · in ${mins(eta)} min</small></dd>`);
+  rows.push(`<dt>Wind pressure</dt><dd>${mp.pd.toFixed(1)} nPa<small>${press} · of the wind hitting now</small></dd>`);
+  rows.push(`<dt>Magnetopause</dt><dd>${mp.r0.toFixed(1)} R⊕<small>${Math.round(mp.r0 * RE_KM).toLocaleString()} km sunward${mp.r0 < GEO_R ? ' · inside GEO: geostationary satellites exposed' : ''}</small></dd>`);
+  rows.push(`<dt></dt><dd><span class="wind-legend"></span><small>slow 300 · 450 · 700+ km/s fast</small></dd>`);
+  mpLabel.element.innerHTML = `Magnetopause <small>${mp.r0.toFixed(1)} R⊕ · ${mp.pd.toFixed(1)} nPa</small>`;
+  return rows;
+}
+
 // ------------------------------------------------------------------- loop
 const clock = $('clock');
 let lastFrame = performance.now();
@@ -746,6 +944,7 @@ function frame(tNow) {
   if (now - lastBodies > 1000) { updateBodies(now); lastBodies = now; }
   updateSatellites(now);
   updateCamera(dt);
+  updateWind(dt, now);
   controls.update();
   renderer.render(scene, camera);
   labelRenderer.render(scene, camera);

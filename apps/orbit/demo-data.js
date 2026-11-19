@@ -10,6 +10,8 @@ function meanMotion(altKm) {
   return (Math.sqrt(MU / a ** 3) * 86400) / (2 * Math.PI); // rev/day
 }
 
+const DEMO_SHOCK_AT = Date.now() - 25 * 60000;
+
 let seed = 42;
 const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
 
@@ -39,11 +41,25 @@ export function synthCatalogCsv() {
 export function synthNoaa(key) {
   const now = Date.now();
   const tag = (minsAgo) => new Date(now - minsAgo * 60000).toISOString().slice(0, 19);
+  // A shock (CME-like jump to fast, dense, south-pointing wind) passed L1 25 min
+  // before this module loaded, so it reaches Earth ~20 min after the page opens.
+  const sinceShock = (minsAgo) => (now - minsAgo * 60000 - DEMO_SHOCK_AT) / 60000;
   if (key === 'wind') {
-    return Array.from({ length: 60 }, (_, i) => ({ time_tag: tag(i + 1), active: true, source: 'DEMO', proton_speed: 430 + 20 * Math.sin(i / 7), proton_density: 5.2, proton_temperature: 95000 }));
+    return Array.from({ length: 240 }, (_, i) => {
+      const m = sinceShock(i + 1), after = m >= 0;
+      return {
+        time_tag: tag(i + 1), active: true, source: 'DEMO',
+        proton_speed: after ? 610 + 25 * Math.sin(m / 6) : 370 + 15 * Math.sin(i / 9),
+        proton_density: after ? 6 + 16 * Math.exp(-m / 12) : 4 + Math.sin(i / 11),
+        proton_temperature: after ? 300000 : 70000,
+      };
+    });
   }
   if (key === 'mag') {
-    return Array.from({ length: 60 }, (_, i) => ({ time_tag: tag(i + 1), active: true, source: 'DEMO', bt: 6.1, bx_gsm: 2.1, by_gsm: -3.2, bz_gsm: -4.4 + Math.sin(i / 5) }));
+    return Array.from({ length: 240 }, (_, i) => {
+      const m = sinceShock(i + 1);
+      return { time_tag: tag(i + 1), active: true, source: 'DEMO', bt: m >= 0 ? 18 : 5, bx_gsm: 2.1, by_gsm: -3.2, bz_gsm: m >= 0 ? -12 + 3 * Math.sin(m / 4) : 2 + Math.sin(i / 5) };
+    });
   }
   if (key === 'xray') {
     return Array.from({ length: 60 }, (_, i) => ({ time_tag: tag(i + 1), satellite: 19, energy: '0.1-0.8nm', flux: 2.4e-6, observed_flux: 2.4e-6 }));
