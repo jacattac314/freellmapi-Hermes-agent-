@@ -75,8 +75,10 @@ async function get(key) {
   const cur = cache.get(key);
   const lastAttempt = cur?.lastAttempt ?? 0;
   const fresh = cur && Date.now() - cur.fetchedAt < src.ttl;
-  // After a failure, don't retry more often than the TTL either (CelesTrak is strict).
-  const backingOff = cur?.error && Date.now() - lastAttempt < Math.min(src.ttl, 10 * MIN);
+  // After a failure, back off: up to 10 min while a cached copy can be served
+  // (CelesTrak is strict about polling), but only 30 s when there is nothing to show.
+  const backoff = cur?.body ? Math.min(src.ttl, 10 * MIN) : 30_000;
+  const backingOff = cur?.error && Date.now() - lastAttempt < backoff;
   if (fresh || backingOff) return cur;
   if (!inflight.has(key)) {
     inflight.set(key, refresh(key)

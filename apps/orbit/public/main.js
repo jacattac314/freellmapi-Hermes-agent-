@@ -676,9 +676,11 @@ async function pollAurora() {
     wx.aurora = { data, error: null };
     const pts = [], cols = [], c = new THREE.Color();
     for (const [lon, lat, v] of data.coordinates || []) {
-      if (v < 4) continue;
+      // OVATION's grid carries a spurious non-zero row on the equator; real aurora
+      // stays poleward of ~30° even in extreme storms.
+      if (v < 4 || Math.abs(lat) < 30) continue;
       pts.push(lonLatToVec(lon, lat, 1.012));
-      const t = Math.min(v / 50, 1);
+      const t = Math.min(v / 30, 1); // OVATION values are % probability; >30 is a strong display
       c.setRGB(0.15 + 0.85 * Math.max(0, t - 0.5) * 2, 0.9 - 0.4 * t, 0.35); // green → red as intensity rises
       cols.push(c.r * (0.4 + t), c.g * (0.4 + t), c.b * (0.4 + t));
     }
@@ -758,7 +760,8 @@ function noteDemo(res) {
 // as best-effort. Values only change while the station has a ground link
 // (TIME_000001 Status.Class === "24" means signal acquired).
 const ISS_CHANNELS = {
-  USLAB000058: { label: 'Cabin pressure (Lab)', fmt: (v) => `${Number(v).toFixed(2)} psi` },
+  // ISSLive reports this in mmHg (~760 at sea-level pressure).
+  USLAB000058: { label: 'Cabin pressure (Lab)', fmt: (v) => `${(Number(v) * 0.0193368).toFixed(2)} psi<small>${Math.round(Number(v))} mmHg</small>` },
   USLAB000059: { label: 'Cabin temp (Lab)', fmt: (v) => `${Number(v).toFixed(1)} °C` },
   NODE3000001: { label: 'O₂ partial pressure', fmt: (v) => `${Number(v).toFixed(1)} mmHg` },
   NODE3000003: { label: 'CO₂ partial pressure', fmt: (v) => `${Number(v).toFixed(2)} mmHg` },

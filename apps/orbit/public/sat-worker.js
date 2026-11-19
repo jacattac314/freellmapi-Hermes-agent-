@@ -81,13 +81,16 @@ function classify(rec) {
   else if (periodMin < 128) regime = 'LEO';
   else if (periodMin > 1380 && periodMin < 1500) regime = 'GEO';
   else regime = 'MEO';
+  // The ISS and Tiangong are catalogued module by module, all at the same spot:
+  // keep one entry per station (Zarya, Tianhe) and drop the rest as duplicates.
+  const dup = /^(ISS|CSS) \(/.test(name) && rec.NORAD_CAT_ID !== '25544' && rec.NORAD_CAT_ID !== '48274';
   let group = 'other';
-  if (rec.NORAD_CAT_ID === '25544' || rec.NORAD_CAT_ID === '48274' || /\b(ISS|CSS|TIANHE)\b/.test(name)) group = 'station';
+  if (rec.NORAD_CAT_ID === '25544' || rec.NORAD_CAT_ID === '48274') group = 'station';
   else {
     for (const [g, re] of GROUP_PATTERNS) if (re.test(name)) { group = g; break; }
     if (group === 'other' && regime === 'GEO') group = 'comms';
   }
-  return { regime, group, periodMin, perigee, apogee };
+  return { regime, group, periodMin, perigee, apogee, dup };
 }
 
 function loadElements(csvText) {
@@ -100,8 +103,9 @@ function loadElements(csvText) {
     try { satrec = json2satrec(rec); } catch { failed++; continue; }
     if (satrec.error) { failed++; continue; }
     const id = rec.NORAD_CAT_ID;
-    seen.add(id);
     const meta = classify(rec);
+    if (meta.dup) continue;
+    seen.add(id);
     const existing = indexById.get(id);
     if (existing !== undefined) {
       Object.assign(sats[existing], { satrec, name: rec.OBJECT_NAME, epoch: rec.EPOCH, ...meta, dead: false });
