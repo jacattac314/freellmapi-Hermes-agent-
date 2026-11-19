@@ -74,6 +74,7 @@ const shim = `
 ${demo}
 const LAND_TOPO = ${land};
 const STARS = ${read('public/stars.json')};
+const PROBES = ${read('public/probes.json')};
 const WORKER_SRC = ${JSON.stringify(worker)};
 const realFetch = window.fetch.bind(window);
 const SNAPSHOT = ${SNAP ? JSON.stringify({ at: snapAt, files: SNAP_FILES }) : 'null'};
@@ -82,6 +83,7 @@ window.fetch = async (url, opts) => {
   const u = String(url);
   if (u.endsWith('land-110m.json')) return new Response(JSON.stringify(LAND_TOPO), { headers: { 'Content-Type': 'application/json' } });
   if (u.endsWith('/stars.json')) return new Response(JSON.stringify(STARS), { headers: { 'Content-Type': 'application/json' } });
+  if (u.endsWith('/probes.json')) return new Response(JSON.stringify(PROBES), { headers: { 'Content-Type': 'application/json' } });
   const m = u.match(/\\/api\\/data\\/(\\w+)$/);
   if (!m) return realFetch(url, opts);
   const key = m[1];

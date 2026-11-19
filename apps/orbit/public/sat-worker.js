@@ -35,7 +35,8 @@ let pendingCorrection = false;
 // Simulation clock (mirrors the main thread's).
 let clock = { anchorReal: Date.now(), anchorSim: Date.now(), rate: 1, epoch: 0 };
 const simNow = () => clock.anchorSim + (Date.now() - clock.anchorReal) * clock.rate;
-const simStep = () => Math.min(1000 * clock.rate, MAX_SIM_STEP_MS);
+// Signed step: negative when time runs backwards; paused clocks use a fixed 1 s pair.
+const simStep = () => (clock.rate === 0 ? 1000 : Math.sign(clock.rate) * Math.min(1000 * Math.abs(clock.rate), MAX_SIM_STEP_MS));
 let nextT = 0;
 let timer = null;
 
@@ -166,21 +167,22 @@ function sendCatalog() {
 function restart() {
   if (timer) clearInterval(timer);
   timer = null;
-  if (!sats.length || clock.rate > MAX_RATE) return;
-  const step = simStep();
-  nextT = Math.floor(simNow() / step) * step;
+  if (!sats.length || clock.hidden || Math.abs(clock.rate) > MAX_RATE) return;
+  const step = simStep(), mag = Math.abs(step);
+  const base = Math.floor(simNow() / mag) * mag;
+  if (clock.rate === 0) { snapshot(base); snapshot(base + 1000); return; } // paused: a static pair
+  nextT = base;
   snapshot(nextT);
   snapshot(nextT + step);
   snapshot(nextT + 2 * step);
   nextT += 2 * step;
-  const realStep = step / clock.rate;
+  const ahead = (t) => (step > 0 ? nextT < t : nextT > t);
   timer = setInterval(() => {
-    // Stay ~2 steps ahead of simulation time; resync if the tab was throttled.
-    const st = simStep();
-    const target = simNow() + 2 * st;
-    if (target - nextT > 10 * st) nextT = Math.floor(simNow() / st) * st;
-    while (nextT < target) { nextT += st; snapshot(nextT); }
-  }, Math.max(50, realStep / 2));
+    // Stay ~2 steps ahead of simulation time (in its direction); resync if throttled.
+    const target = simNow() + 2 * step;
+    if (Math.abs(target - nextT) > 10 * mag) nextT = Math.floor(simNow() / mag) * mag;
+    while (ahead(target)) { nextT += step; snapshot(nextT); }
+  }, Math.max(50, mag / Math.abs(clock.rate) / 2));
 }
 
 // Full orbit ring for a selected satellite: one period from time `t`, inertial frame.

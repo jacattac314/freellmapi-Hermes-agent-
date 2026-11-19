@@ -38,7 +38,7 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.minDistance = 1.15;
-controls.maxDistance = 3e6;
+controls.maxDistance = 2e7;
 controls.enablePan = false;
 
 scene.add(new THREE.AmbientLight(0x334466, 0.35));
@@ -153,6 +153,10 @@ function makeLabel(html) {
 const moon = new THREE.Mesh(new THREE.SphereGeometry(1737.4 / RE_KM, 48, 32), new THREE.MeshPhongMaterial({ color: 0x9a9a9a }));
 const moonLabel = makeLabel('Moon');
 moon.add(moonLabel);
+const moonMarker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+  new THREE.PointsMaterial({ color: 0xd0d0d0, size: 5, sizeAttenuation: false }));
+moonMarker.frustumCulled = false;
+moon.add(moonMarker);
 scene.add(moon);
 
 // Sun marker (direction only — the real Sun is ~23,500 Earth radii away)
@@ -298,7 +302,7 @@ let catalog = null; // { ids, names, regimes, groups, periods, epochs, dead }
 let N = 0;
 let satGeom = null, satPoints = null, posAttr = null;
 let visible = new Uint8Array(0);
-const satMat = new THREE.PointsMaterial({ size: 3, sizeAttenuation: false, vertexColors: true, map: dotTex, alphaTest: 0.5, transparent: true });
+const satMat = new THREE.PointsMaterial({ size: 3, sizeAttenuation: false, vertexColors: true, map: dotTex, alphaTest: 0.05, transparent: true });
 
 const selMarker = new THREE.Points(
   new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(3), 3)),
@@ -325,10 +329,6 @@ issMarker.add(issLabel);
 scene.add(issMarker);
 let issIndex = -1;
 
-const trackLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55 }));
-trackLine.visible = false;
-trackLine.frustumCulled = false;
-scene.add(trackLine);
 
 function buildSatGeometry() {
   if (satPoints) { scene.remove(satPoints); satGeom.dispose(); }
@@ -399,7 +399,7 @@ let correctionsApplied = 0;
 const satPos = (i, out) => out.set(posAttr.array[i * 3], posAttr.array[i * 3 + 1], posAttr.array[i * 3 + 2]);
 
 function updateSatellites(now) {
-  if (!posAttr || snaps.length === 0 || simClock.rate > MAX_SAT_RATE) return;
+  if (!posAttr || snaps.length === 0 || !satsAllowed() || satsAlpha <= 0.02) return;
   let A, B;
   for (let i = 0; i < snaps.length - 1; i++) if (snaps[i].t <= now && now < snaps[i + 1].t) { A = snaps[i]; B = snaps[i + 1]; }
   if (!A) { // worker behind (throttled tab) or not started: extrapolate from the newest pair
@@ -438,7 +438,7 @@ function updateSatellites(now) {
 
 // --- worker wiring
 const worker = new Worker('/sat-worker.js', { type: 'module' });
-window.__orbit = { worker, get positions() { return posAttr?.array; } }; // debug hook (used by the smoothness test)
+window.__orbit = { worker, get positions() { return posAttr?.array; }, get sim() { return simRender; } }; // debug hook (used by the smoothness test)
 const freshness = { gp: null, gpError: null, satsLoaded: 0 };
 worker.onmessage = (e) => {
   const m = e.data;
@@ -447,13 +447,10 @@ worker.onmessage = (e) => {
     catalog = m; N = m.ids.length;
     buildTypeList();
     if (grew) buildSatGeometry(); else applyFilters();
+    requestTracks();
   } else if (m.type === 'snapshot') onSnapshot(m);
   else if (m.type === 'loaded') freshness.satsLoaded = m.total;
-  else if (m.type === 'track' && selected >= 0 && catalog.ids[selected] === m.id) {
-    trackLine.geometry.dispose();
-    trackLine.geometry = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(m.pts, 3));
-    trackLine.visible = true;
-  }
+  else if (m.type === 'track') onTrack(m);
 };
 
 let lastGpFetchedAt = 0;
@@ -583,34 +580,231 @@ function select(i) {
   selected = i;
   following = false;
   $('sel-follow').classList.remove('active');
-  trackLine.visible = false;
-  if (i < 0) { $('selection').hidden = true; selMarker.visible = false; return; }
+  if (i < 0) { $('selection').hidden = true; selMarker.visible = false; requestTracks(); return; }
   $('selection').hidden = false;
   $('sel-name').textContent = catalog.names[i];
   if (innerWidth <= 820 && !document.body.classList.contains('show-right')) showPanel('right');
-  worker.postMessage({ type: 'track', id: catalog.ids[i], t: simNow() });
+  requestTracks();
 }
 $('sel-clear').onclick = () => select(-1);
 $('sel-follow').onclick = () => { following = !following; $('sel-follow').classList.toggle('active', following); };
-setInterval(() => { if (selected >= 0) worker.postMessage({ type: 'track', id: catalog.ids[selected], t: simNow() }); }, 10000);
 
-const MAX_SAT_RATE = 3600; // above this the worker pauses satellites
-function setRate(rate) {
-  const live = rate === 1;
-  const paused = rate > MAX_SAT_RATE;
-  if (satPoints) satPoints.visible = !paused;
-  issMarker.visible = issMarker.visible && !paused;
-  selMarker.visible = selMarker.visible && !paused;
-  trackLine.visible = trackLine.visible && !paused;
-  simClock = { anchorReal: Date.now(), anchorSim: live ? Date.now() : simNow(), rate, epoch: simClock.epoch + 1 };
+// ------------------------------------------------------------------- time
+// The clock has a *target* (where time is heading) and a *rendered* time that
+// glides toward it, so scrubbing and "Now" sweep smoothly instead of jumping.
+// While it glides a long way, satellites fade out and back in, because SGP4
+// can't propagate 17,000 objects every frame.
+const MAX_SAT_RATE = 3600;                 // above this the worker pauses satellites
+const SAT_WINDOW_MS = 30 * 86400000;       // orbit elements are only meaningful near today
+const RATES = [-2592000, -86400, -3600, -300, -60, -10, -1, 1, 10, 60, 300, 3600, 86400, 2592000];
+let simRender = Date.now();
+let gliding = false;
+let lastNonZeroRate = 1;
+let satsAlpha = 1;
+
+function satsAllowed() {
+  return Math.abs(simClock.rate) <= MAX_SAT_RATE && Math.abs(simNow() - Date.now()) < SAT_WINDOW_MS;
+}
+function setClock(sim, rate, { glide = true } = {}) {
+  simClock = { anchorReal: Date.now(), anchorSim: sim, rate, epoch: simClock.epoch + 1, hidden: false };
+  simClock.hidden = !satsAllowed();
+  if (rate !== 0) lastNonZeroRate = rate;
+  gliding = glide && Math.abs(simRender - sim) > 2000;
+  if (!gliding) simRender = sim;
   snaps.length = 0; // positions now come from the new timeline
   activeCorr = null;
   worker.postMessage({ type: 'clock', clock: simClock });
-  if (selected >= 0) worker.postMessage({ type: 'track', id: catalog.ids[selected], t: simNow() });
-  document.querySelectorAll('#time-rate button').forEach((b) => b.classList.toggle('active', Number(b.dataset.rate) === rate));
+  requestTracks();
+  renderTimeUi();
 }
-document.querySelectorAll('#time-rate button').forEach((b) => { b.onclick = () => setRate(Number(b.dataset.rate)); });
-function rateLabel(r) { return r >= 86400 ? `${r / 86400} d/s` : `${r}×`; }
+function rateLabel(r) {
+  if (r === 0) return 'Paused';
+  const a = Math.abs(r), sign = r < 0 ? '−' : '';
+  if (r === 1) return 'Live speed';
+  return sign + (a >= 86400 ? `${a / 86400} d/s` : a >= 3600 ? `${a / 3600} h/s` : `${a}×`);
+}
+function stepRate(dir) {
+  const cur = simClock.rate === 0 ? lastNonZeroRate : simClock.rate;
+  let i = RATES.indexOf(cur);
+  if (i < 0) i = RATES.indexOf(1);
+  i = Math.max(0, Math.min(RATES.length - 1, i + dir));
+  setClock(simNow(), RATES[i], { glide: false });
+}
+$('t-rev').onclick = () => stepRate(-1);
+$('t-fwd').onclick = () => stepRate(1);
+$('t-play').onclick = () => setClock(simNow(), simClock.rate === 0 ? lastNonZeroRate : 0, { glide: false });
+$('t-now').onclick = () => setClock(Date.now(), 1); // glides back to the present
+
+// Timeline: ±1 year, cubic so the region near "now" gets fine control.
+const SCRUB_MAX_DAYS = 365;
+const scrubToOffset = (v) => Math.sign(v) * Math.pow(Math.abs(v) / 1000, 3) * SCRUB_MAX_DAYS * 86400000;
+const offsetToScrub = (ms) => Math.sign(ms) * Math.cbrt(Math.min(Math.abs(ms) / (SCRUB_MAX_DAYS * 86400000), 1)) * 1000;
+const scrub = $('t-scrub');
+let scrubbing = false, rateBeforeScrub = 1;
+scrub.addEventListener('pointerdown', () => { scrubbing = true; rateBeforeScrub = simClock.rate; });
+scrub.addEventListener('input', () => {
+  if (!scrubbing) { scrubbing = true; rateBeforeScrub = simClock.rate; }
+  setClock(Date.now() + scrubToOffset(Number(scrub.value)), 0);
+});
+const endScrub = () => {
+  if (!scrubbing) return;
+  scrubbing = false;
+  setClock(simNow(), rateBeforeScrub === 0 ? 0 : rateBeforeScrub);
+};
+scrub.addEventListener('change', endScrub);
+scrub.addEventListener('pointerup', endScrub);
+
+function fmtOffset(ms) {
+  const a = Math.abs(ms), sign = ms < 0 ? '−' : '+';
+  if (a < 60000) return 'now';
+  if (a < 3600000) return `${sign}${Math.round(a / 60000)} min`;
+  if (a < 2 * 86400000) return `${sign}${(a / 3600000).toFixed(1)} h`;
+  return `${sign}${Math.round(a / 86400000)} d`;
+}
+function renderTimeUi() {
+  const live = simClock.rate === 1 && Math.abs(simNow() - Date.now()) < 5000;
+  $('t-rate').textContent = live ? 'Live' : rateLabel(simClock.rate);
+  $('t-now').classList.toggle('active', live);
+  $('t-play').textContent = simClock.rate === 0 ? '▶' : '❚❚';
+  $('t-play').title = simClock.rate === 0 ? 'Play' : 'Pause';
+  if (!scrubbing) scrub.value = String(Math.round(offsetToScrub(simNow() - Date.now())));
+  const t = new Date(simRender).toISOString();
+  const off = simNow() - Date.now();
+  const note = !satsAllowed() ? (Math.abs(simClock.rate) > MAX_SAT_RATE ? ' · satellites paused (too fast)' : ' · satellites hidden (orbit data is for today)') : '';
+  clock.innerHTML = live
+    ? `${t.slice(11, 19)} UTC`
+    : `${t.slice(0, 10)} ${t.slice(11, 16)} UTC<span class="rate">${fmtOffset(off)} · ${rateLabel(simClock.rate)}${note}</span>`;
+}
+
+function updateSimTime(dt) {
+  const target = simNow();
+  if (gliding) {
+    const diff = target - simRender;
+    simRender += diff * (1 - Math.exp(-dt * 2.8)); // ~2 s glide
+    if (Math.abs(target - simRender) < Math.max(1000, Math.abs(simClock.rate) * 50)) { gliding = false; simRender = target; }
+  } else simRender = target;
+  // Satellites fade out while gliding or when out of range, and back in when settled.
+  const want = satsAllowed() && !gliding ? 1 : 0;
+  satsAlpha += (want - satsAlpha) * (1 - Math.exp(-dt * 6));
+  satMat.opacity = satsAlpha;
+  const show = satsAlpha > 0.02;
+  if (satPoints) satPoints.visible = show;
+  for (const line of tracks.values()) line.visible = show && $('layer-orbits').checked && line.userData.ok;
+  if (!show) { issMarker.visible = false; selMarker.visible = false; }
+  return simRender;
+}
+
+// ------------------------------------------------------------ orbit paths
+// One closed orbit for the stations and whatever is selected (from the worker,
+// inertial frame), the Moon's orbit, plus probe trajectories further down.
+const tracks = new Map(); // NORAD id → THREE.Line
+const STATION_IDS = ['25544', '48274'];
+function trackIds() { return [...new Set([...STATION_IDS, ...(selected >= 0 ? [catalog.ids[selected]] : [])])]; }
+function requestTracks() {
+  if (!catalog || !satsAllowed()) return;
+  for (const id of trackIds()) worker.postMessage({ type: 'track', id, t: simNow() });
+  for (const [id, line] of tracks) if (!trackIds().includes(id)) { scene.remove(line); line.geometry.dispose(); tracks.delete(id); }
+}
+function onTrack(m) {
+  let line = tracks.get(m.id);
+  if (!line) {
+    const isSel = selected >= 0 && catalog.ids[selected] === m.id;
+    line = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: isSel ? 0.6 : 0.3 }));
+    line.frustumCulled = false;
+    scene.add(line);
+    tracks.set(m.id, line);
+  }
+  line.geometry.dispose();
+  line.geometry = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(m.pts, 3));
+  line.material.opacity = selected >= 0 && catalog.ids[selected] === m.id ? 0.6 : 0.3;
+  line.userData.ok = true;
+}
+setInterval(requestTracks, 15000);
+
+const moonOrbit = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xbfbfbf, transparent: true, opacity: 0.35 }));
+moonOrbit.frustumCulled = false;
+scene.add(moonOrbit);
+let moonOrbitAt = -Infinity;
+function updateMoonOrbit(t) {
+  if (Math.abs(t - moonOrbitAt) < 6 * 3600000) return;
+  moonOrbitAt = t;
+  const pts = [];
+  for (let k = -168; k <= 168; k++) pts.push(toThree(moonEci(new Date(t + k * 2 * 3600000))).divideScalar(RE_KM)); // ±14 days
+  moonOrbit.geometry.dispose();
+  moonOrbit.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+}
+
+// ----------------------------------------------------------------- probes
+// Real trajectories from NASA/JPL Horizons (public/probes.json, fetched by
+// fetch-probes.mjs): geocentric ICRF positions sampled at a fixed step.
+function j2000ToScene(x, y, z, out) {
+  // ICRF equatorial → ecliptic, precess to date, back to equatorial (scene axes, Earth radii).
+  const ce = Math.cos(OBLIQ), se = Math.sin(OBLIQ), cp = Math.cos(precessionRad), sp = Math.sin(precessionRad);
+  const ey = y * ce + z * se, ez = -y * se + z * ce;
+  const px = x * cp - ey * sp, py = x * sp + ey * cp;
+  const qy = py * ce - ez * se, qz = py * se + ez * ce;
+  return out.set(px, qz, -qy).divideScalar(RE_KM);
+}
+const probes = [];
+fetch('/probes.json').then((r) => r.json()).then((data) => {
+  for (const p of data.probes) {
+    const n = p.xyz.length / 3;
+    const kmAt = (i) => [p.xyz[i * 3] * 1000, p.xyz[i * 3 + 1] * 1000, p.xyz[i * 3 + 2] * 1000];
+    const maxAu = Math.max(...Array.from({ length: n }, (_, i) => Math.hypot(...kmAt(i)))) / 1.496e8;
+    const nearEarth = maxAu < 0.05; // L1/L2 craft: draw their loops around Earth
+    const pts = [];
+    const v = new THREE.Vector3();
+    for (let i = 0; i < n; i++) {
+      j2000ToScene(...kmAt(i), v);
+      if (!nearEarth) { // heliocentric drawing: add Earth's own position at that moment
+        const T = julianCenturies(p.t0 + i * p.dt);
+        v.add(eclToScene(planetHelio(PLANETS[2], T)));
+      }
+      pts.push(v.clone());
+    }
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: 0xffb74d, transparent: true, opacity: 0.4 }));
+    line.frustumCulled = false;
+    (nearEarth ? scene : solarGroup).add(line);
+    const marker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+      new THREE.PointsMaterial({ color: 0xffcc80, size: 6, sizeAttenuation: false, map: dotTex, alphaTest: 0.5, transparent: true }));
+    marker.frustumCulled = false;
+    const label = makeLabel(p.name);
+    label.element.title = p.note;
+    marker.add(label);
+    scene.add(marker);
+    probes.push({ ...p, n, kmAt, nearEarth, line, marker, label, distKm: 0 });
+  }
+  $('probe-count').textContent = `${probes.length} probes · JPL Horizons, ${data.generated.slice(0, 10)}`;
+}).catch((e) => console.warn('probes', e));
+
+const pv = new THREE.Vector3();
+function updateProbes(t, camDist) {
+  const on = $('layer-probes').checked, labelsOn = $('layer-labels').checked;
+  for (const p of probes) {
+    const f = (t - p.t0) / p.dt;
+    const inRange = f >= 0 && f <= p.n - 1;
+    // Sun-orbiting probes' paths only make sense at planet scale; L1/L2 loops from the Moon out.
+    p.line.visible = on && $('layer-orbits').checked && camDist > (p.nearEarth ? 60 : 3000);
+    p.marker.visible = on && inRange;
+    if (!inRange) continue;
+    const i = Math.min(Math.floor(f), p.n - 2), u = f - i;
+    const a = p.kmAt(i), b = p.kmAt(i + 1);
+    const x = a[0] + (b[0] - a[0]) * u, y = a[1] + (b[1] - a[1]) * u, z = a[2] + (b[2] - a[2]) * u;
+    p.distKm = Math.hypot(x, y, z);
+    p.marker.position.copy(j2000ToScene(x, y, z, pv));
+    // Label when the camera is far enough out for this probe to be in a sensible frame.
+    p.label.visible = labelsOn && camDist > 60 && p.distKm / RE_KM < camDist * 6 && p.distKm / RE_KM > camDist / 400;
+  }
+}
+setInterval(() => {
+  for (const p of probes) {
+    if (!p.marker.visible) continue;
+    const au = p.distKm / 1.496e8;
+    p.label.element.innerHTML = `${p.name}<small>${au < 0.1 ? Math.round(p.distKm / 1000).toLocaleString() + ' thousand km' : au.toFixed(au < 10 ? 2 : 1) + ' AU'} from Earth</small>`;
+  }
+}, 1000);
+
 
 let downAt = null;
 renderer.domElement.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
@@ -689,9 +883,10 @@ const STOPS = [
   { name: 'Earth–Moon', dist: 150, desc: 'The Moon at ~384,000 km (60 Earth radii). Satellites collapse into a speck at this scale. Moon position: low-precision ephemeris.' },
   { name: 'Sun–Earth L1', dist: 800, desc: '1.5 million km sunward: ACE and DSCOVR measure the solar wind here. The stream shows the last hour of those measurements on its way to Earth, coloured by speed.' },
   { name: 'Inner solar system', dist: 1.3e5, desc: 'Mercury, Venus, Earth and Mars where they are today, from NASA JPL orbital elements. Earth is 1 AU (150 million km) from the Sun; light takes 8 minutes to cross it.' },
-  { name: 'Outer solar system', dist: 2.4e6, desc: 'Jupiter to Neptune. Neptune is 30 AU out, over 4 light-hours. Try 30 d/s to watch the inner planets lap the outer ones.' },
+  { name: 'Outer solar system', dist: 2.4e6, desc: 'Jupiter to Neptune, with the probes heading out. Neptune is 30 AU away, over 4 light-hours. Try 30 d/s to watch the inner planets lap the outer ones.' },
+  { name: 'Interstellar', dist: 2e7, desc: 'Voyager 1 (~177 AU) and Voyager 2 (~148 AU) have left the Sun’s bubble of solar wind. A radio signal from Voyager 1 takes about a day to reach us.' },
 ];
-STOPS.forEach((st, i) => { st.short = ['Surface', 'LEO', 'Nav sats', 'GEO', 'Moon', 'L1', 'Inner planets', 'Outer planets'][i]; });
+STOPS.forEach((st, i) => { st.short = ['Surface', 'LEO', 'Nav sats', 'GEO', 'Moon', 'L1', 'Inner', 'Outer', 'Voyagers'][i]; });
 const slider = $('scale-slider');
 slider.max = String(STOPS.length - 1);
 $('scale-ticks').innerHTML = STOPS.map((s, i) => `<span data-i="${i}" style="left:${(i / (STOPS.length - 1)) * 100}%">${s.short}</span>`).join('');
@@ -785,6 +980,7 @@ function updateLabelVisibility(dist = camera.position.length()) {
     p.orbit.visible = dist > 3000; // closer in they only cut across the view as straight lines
   }
   earthMarker.visible = dist > 3000;
+  moonOrbit.visible = $('layer-orbits').checked && dist > 20 && dist < 20000;
   auroraPoints.visible = $('layer-aurora').checked && dist < 12;
   mpLabel.visible = on && dist > 8 && dist < 120;
 }
@@ -1073,7 +1269,7 @@ function updateWind(dt, now) {
   const latest = windSeries[windSeries.length - 1];
   const on = $('layer-wind').checked && !!latest;
   windPoints.visible = on;
-  mpGroup.visible = on;
+  mpGroup.visible = on && camera.position.distanceTo(controls.target) < 100; // clutter beyond GEO scale
   if (!on) return;
   windStatus = windTimeline(now);
   const arriving = windStatus.arriving;
@@ -1164,10 +1360,12 @@ function frame(tNow) {
   const dt = Math.min((tNow - lastFrame) / 1000, 0.1);
   lastFrame = tNow;
   const now = Date.now();
-  const sim = simNow();
+  const sim = updateSimTime(dt);
   updateBodies(sim);
+  updateMoonOrbit(sim);
   updateSatellites(sim);
   updateCamera(dt);
+  updateProbes(sim, camera.position.distanceTo(controls.target));
   updateWind(dt, now);
   controls.update();
   renderer.render(scene, camera);
@@ -1182,11 +1380,7 @@ addEventListener('resize', () => {
   labelRenderer.setSize(innerWidth, innerHeight);
 });
 
-setInterval(() => {
-  const t = new Date(simNow()).toISOString();
-  clock.innerHTML = simClock.rate === 1
-    ? `${t.slice(11, 19)} UTC`
-    : `${t.slice(0, 10)} ${t.slice(11, 16)} UTC<span class="rate">${rateLabel(simClock.rate)}${simClock.rate > MAX_SAT_RATE ? ' · satellites paused' : ''}</span>`; renderSelection(); renderFreshness(); renderWeather(); }, 500);
+setInterval(() => { renderTimeUi(); renderSelection(); renderFreshness(); renderWeather(); }, 500);
 
 updateBodies(Date.now());
 setScaleValue(1);

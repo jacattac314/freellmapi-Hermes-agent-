@@ -68,6 +68,9 @@
           <option value="600">600× faster</option>
         </select>
       </label>
+      <label><input type="checkbox" id="layer-orbits" checked /> Orbit paths</label>
+      <label><input type="checkbox" id="layer-probes" checked /> Deep-space probes</label>
+      <div id="probe-count" class="muted small"></div>
       <label><input type="checkbox" id="layer-rings" checked /> GEO ring</label>
       <label><input type="checkbox" id="layer-labels" checked /> Labels</label>
     </section>
@@ -102,14 +105,17 @@
   <footer id="scale" class="panel">
     <div class="scale-head">
       <div id="scale-title"></div>
-      <div id="time-rate" role="group" aria-label="Time speed">
-        <button data-rate="1" class="active">Live</button>
-        <button data-rate="10">10×</button>
-        <button data-rate="60">60×</button>
-        <button data-rate="300">300×</button>
-        <button data-rate="86400" title="One day per second (satellites paused)">1 d/s</button>
-        <button data-rate="2592000" title="Thirty days per second (satellites paused)">30 d/s</button>
+      <div id="time-ctl" role="group" aria-label="Time controls">
+        <button id="t-rev" title="Slower, then backwards">◀◀</button>
+        <button id="t-play" title="Pause">❚❚</button>
+        <button id="t-fwd" title="Faster">▶▶</button>
+        <span id="t-rate" class="mono">Live</span>
+        <button id="t-now" class="active" title="Glide back to the present">Now</button>
       </div>
+    </div>
+    <div class="timeline">
+      <input id="t-scrub" type="range" min="-1000" max="1000" step="1" value="0" aria-label="Time, one year either side of now" />
+      <div class="timeline-ticks"><span style="left:0%">−1 yr</span><span style="left:28.2%">−1 mo</span><span style="left:50%">now</span><span style="left:71.8%">+1 mo</span><span style="left:100%">+1 yr</span></div>
     </div>
     <input id="scale-slider" type="range" min="0" max="5" step="0.001" value="1" aria-label="View scale" />
     <div id="scale-ticks"></div>
