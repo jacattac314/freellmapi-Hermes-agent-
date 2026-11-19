@@ -119,3 +119,16 @@ body.demo #left, body.demo #right { top: 80px; }
 .select-row { justify-content: space-between; }
 select { background: rgba(0, 0, 0, 0.35); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font: inherit; padding: 2px 4px; }
 .wind-legend { display: block; height: 6px; border-radius: 3px; margin: 4px 0 2px; background: linear-gradient(90deg, #5999ff, #ffffff, #ff8a3d, #ff3d1f); }
+
+.scale-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; }
+.scale-head #scale-title { margin: 0; }
+#time-rate { display: flex; gap: 2px; flex: none; }
+#time-rate button { flex: none; padding: 2px 8px; font-size: 12px; }
+button.link { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; flex: none; }
+.small { font-size: 11px; }
+#type-list label { justify-content: flex-start; }
+#type-list .n { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
+.alt-range { display: grid; gap: 2px; margin: 4px 0; }
+.alt-range input { width: 100%; accent-color: var(--accent); }
+#filter-count { margin-top: 4px; font-size: 12px; }
+#clock .rate { color: var(--stale); margin-left: 6px; }

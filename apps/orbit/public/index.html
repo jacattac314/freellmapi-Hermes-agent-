@@ -33,7 +33,9 @@
     <section>
       <h3>Find</h3>
       <input id="search" type="search" placeholder="ISS, Starlink-1007, GPS…" autocomplete="off" />
+      <label><input type="checkbox" id="only-matches" /> Show only matches on the globe</label>
       <ul id="search-results"></ul>
+      <div id="filter-count" class="muted"></div>
     </section>
     <section>
       <h3>Orbit regime</h3>
@@ -43,12 +45,17 @@
       <label><input type="checkbox" data-regime="HEO" checked /> <span class="sw" style="--c:var(--heo)"></span>Highly elliptical</label>
     </section>
     <section>
-      <h3>Constellations</h3>
-      <label><input type="checkbox" data-group="starlink" checked /> Starlink</label>
-      <label><input type="checkbox" data-group="oneweb" checked /> OneWeb</label>
-      <label><input type="checkbox" data-group="gnss" checked /> Navigation (GPS, Galileo…)</label>
-      <label><input type="checkbox" data-group="station" checked /> Crewed stations</label>
-      <label><input type="checkbox" data-group="other" checked /> Everything else</label>
+      <h3>Type <span class="hint"><button class="link" id="types-all">all</button> · <button class="link" id="types-none">none</button></span></h3>
+      <div id="type-list"></div>
+    </section>
+    <section>
+      <h3>Altitude</h3>
+      <div id="alt-label" class="mono"></div>
+      <div class="alt-range">
+        <input id="alt-min" type="range" min="0" max="12" step="1" value="0" aria-label="Minimum altitude" />
+        <input id="alt-max" type="range" min="0" max="12" step="1" value="12" aria-label="Maximum altitude" />
+      </div>
+      <div class="muted small">Shows objects whose orbit passes through this band.</div>
     </section>
     <section>
       <h3>Layers</h3>
@@ -93,7 +100,15 @@
 
   <!-- Bottom: scale slider -->
   <footer id="scale" class="panel">
-    <div id="scale-title"></div>
+    <div class="scale-head">
+      <div id="scale-title"></div>
+      <div id="time-rate" role="group" aria-label="Time speed">
+        <button data-rate="1" class="active">Live</button>
+        <button data-rate="10">10×</button>
+        <button data-rate="60">60×</button>
+        <button data-rate="300">300×</button>
+      </div>
+    </div>
     <input id="scale-slider" type="range" min="0" max="5" step="0.001" value="1" aria-label="View scale" />
     <div id="scale-ticks"></div>
     <div id="scale-desc" class="muted"></div>

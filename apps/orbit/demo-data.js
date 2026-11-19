@@ -35,6 +35,13 @@ export function synthCatalogCsv() {
   for (let i = 0; i < 420; i++) add(`GEO SAT ${i}`, 35786, rand() * 2, rand() * 360, rand() * 360, 0.0002, 1.0027);
   for (let i = 0; i < 2500; i++) add(`LEO OBJECT ${i}`, 400 + rand() * 1100, 20 + rand() * 80, rand() * 360, rand() * 360, rand() * 0.01);
   for (let i = 0; i < 60; i++) add(`MOLNIYA ${i}`, 0, 63.4, rand() * 360, rand() * 360, 0.72, 2.006);
+  for (let p = 0; p < 6; p++) for (let s = 0; s < 11; s++) add(`IRIDIUM ${100 + p * 11 + s}`, 780, 86.4, p * 31.6, s * (360 / 11));
+  for (let p = 0; p < 8; p++) for (let s = 0; s < 8; s++) add(`KUIPER-${p * 8 + s}`, 630, 51.9, p * 45, s * 45 + p * 5);
+  ['NOAA 20', 'NOAA 21', 'METOP-B', 'METOP-C', 'FENGYUN 3D', 'METEOR-M 2-3', 'JPSS-2', 'DMSP F18'].forEach((n, i) => add(n, 830, 98.7, i * 45, i * 30));
+  ['GOES 18', 'GOES 19', 'METEOSAT-12', 'HIMAWARI-9', 'FENGYUN 4B', 'ELEKTRO-L 4'].forEach((n, i) => add(n, 35786, 0.05, 0, i * 60, 0.0002, 1.0027));
+  for (let i = 0; i < 48; i++) add(`FLOCK 4Y-${i}`, 500, 97.4, (i % 6) * 60, i * 7.5);
+  ['LANDSAT 8', 'LANDSAT 9', 'SENTINEL-2A', 'SENTINEL-2B', 'SENTINEL-1A', 'WORLDVIEW-3'].forEach((n, i) => add(n, 705, 98.2, i * 60, i * 50));
+  ['HST', 'TESS', 'SWIFT', 'FERMI', 'NUSTAR', 'NICER'].forEach((n, i) => add(n, i === 1 ? 0 : 540, i === 1 ? 37 : 28.5, i * 60, i * 60, i === 1 ? 0.55 : 0.0002, i === 1 ? 0.0735 : null));
   return rows.join('\n') + '\n';
 }
 

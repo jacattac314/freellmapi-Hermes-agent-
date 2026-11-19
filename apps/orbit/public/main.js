@@ -14,6 +14,12 @@ const CORR_MS = 5000; // how long an orbit-update correction takes to ease in
 const $ = (id) => document.getElementById(id);
 const toThree = (v) => new THREE.Vector3(v.x, v.z, -v.y);
 
+// Simulation clock. Live = real time. Time-warp runs it `rate`× faster from
+// wherever it is; Live jumps back to now. Satellites, Sun, Moon and day/night
+// follow it; measured data (solar wind, aurora) always stays on real time.
+let simClock = { anchorReal: Date.now(), anchorSim: Date.now(), rate: 1, epoch: 0 };
+const simNow = () => simClock.anchorSim + (Date.now() - simClock.anchorReal) * simClock.rate;
+
 // ------------------------------------------------------------------ scene
 const container = $('scene');
 const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
@@ -256,6 +262,7 @@ function adj(snap, k, w) {
 }
 
 function onSnapshot(msg) {
+  if (msg.epoch !== simClock.epoch) return; // computed for a clock setting we've since changed
   const snap = { t: msg.t, pos: msg.pos, corr: null };
   if (msg.corrected && snaps.length >= 2) {
     // New orbital elements: measure how far each satellite would "jump", then
@@ -331,6 +338,7 @@ worker.onmessage = (e) => {
   if (m.type === 'catalog') {
     const grew = !catalog || m.ids.length !== N;
     catalog = m; N = m.ids.length;
+    buildTypeList();
     if (grew) buildSatGeometry(); else applyFilters();
   } else if (m.type === 'snapshot') onSnapshot(m);
   else if (m.type === 'loaded') freshness.satsLoaded = m.total;
@@ -361,19 +369,56 @@ async function pollCatalog() {
 
 // ---------------------------------------------------------------- filters
 const regimeOn = { LEO: true, MEO: true, GEO: true, HEO: true };
-const groupOn = { starlink: true, oneweb: true, gnss: true, station: true, other: true };
+const GROUPS = [
+  ['station', 'Crewed stations'], ['starlink', 'Starlink'], ['oneweb', 'OneWeb'], ['kuiper', 'Amazon Kuiper'],
+  ['gnss', 'Navigation (GPS, Galileo…)'], ['weather', 'Weather'], ['imaging', 'Earth imaging'],
+  ['science', 'Science & telescopes'], ['comms', 'Communications'], ['other', 'Everything else'],
+];
+const groupOn = Object.fromEntries(GROUPS.map(([g]) => [g, true]));
 document.querySelectorAll('[data-regime]').forEach((el) => el.addEventListener('change', () => { regimeOn[el.dataset.regime] = el.checked; applyFilters(); }));
-document.querySelectorAll('[data-group]').forEach((el) => el.addEventListener('change', () => { groupOn[el.dataset.group] = el.checked; applyFilters(); }));
+
+function buildTypeList() {
+  const counts = {};
+  for (let i = 0; i < N; i++) if (!catalog.dead[i]) counts[catalog.groups[i]] = (counts[catalog.groups[i]] || 0) + 1;
+  $('type-list').innerHTML = GROUPS.filter(([g]) => counts[g]).map(([g, label]) =>
+    `<label><input type="checkbox" data-group="${g}" ${groupOn[g] ? 'checked' : ''} /> ${label}<span class="n">${counts[g].toLocaleString()}</span></label>`).join('');
+  $('type-list').querySelectorAll('[data-group]').forEach((el) => el.addEventListener('change', () => { groupOn[el.dataset.group] = el.checked; applyFilters(); }));
+}
+function setAllTypes(on) {
+  for (const [g] of GROUPS) groupOn[g] = on;
+  $('type-list').querySelectorAll('[data-group]').forEach((el) => { el.checked = on; });
+  applyFilters();
+}
+$('types-all').onclick = () => setAllTypes(true);
+$('types-none').onclick = () => setAllTypes(false);
+
+// Altitude band on a stepped scale that gives LEO room without losing GEO.
+const ALT_STOPS = [0, 300, 450, 600, 800, 1200, 2000, 5000, 15000, 25000, 34000, 38000, Infinity];
+const fmtAlt = (km) => (km === Infinity ? 'any' : km >= 1000 ? `${(km / 1000).toLocaleString()}k` : String(km));
+function altBand() {
+  let lo = Number($('alt-min').value), hi = Number($('alt-max').value);
+  if (lo > hi) [lo, hi] = [hi, lo];
+  return [ALT_STOPS[lo], ALT_STOPS[hi]];
+}
+for (const id of ['alt-min', 'alt-max']) $(id).addEventListener('input', applyFilters);
+$('only-matches').addEventListener('change', applyFilters);
 
 function applyFilters() {
+  const [lo, hi] = altBand();
+  $('alt-label').textContent = lo === 0 && hi === Infinity ? 'All altitudes' : `${fmtAlt(lo)} – ${fmtAlt(hi)} km`;
   if (!catalog) return;
+  const q = $('only-matches').checked ? $('search').value.trim().toUpperCase() : '';
   visible = new Uint8Array(N);
   let count = 0;
   for (let i = 0; i < N; i++) {
-    const on = !catalog.dead[i] && regimeOn[catalog.regimes[i]] && groupOn[catalog.groups[i]];
+    const on = !catalog.dead[i] && regimeOn[catalog.regimes[i]] && groupOn[catalog.groups[i]]
+      && catalog.apogees[i] >= lo && catalog.perigees[i] <= hi
+      && (!q || catalog.names[i].toUpperCase().includes(q) || catalog.ids[i] === q);
     visible[i] = on ? 1 : 0; count += visible[i];
   }
-  $('sat-count').textContent = `${count.toLocaleString()} of ${N.toLocaleString()} objects`;
+  const text = `Showing ${count.toLocaleString()} of ${N.toLocaleString()}`;
+  $('sat-count').textContent = text;
+  $('filter-count').textContent = text;
 }
 
 // Phone layout: panels are sheets toggled from the top bar.
@@ -422,11 +467,22 @@ function select(i) {
   $('selection').hidden = false;
   $('sel-name').textContent = catalog.names[i];
   if (innerWidth <= 820 && !document.body.classList.contains('show-right')) showPanel('right');
-  worker.postMessage({ type: 'track', id: catalog.ids[i] });
+  worker.postMessage({ type: 'track', id: catalog.ids[i], t: simNow() });
 }
 $('sel-clear').onclick = () => select(-1);
 $('sel-follow').onclick = () => { following = !following; $('sel-follow').classList.toggle('active', following); };
-setInterval(() => { if (selected >= 0) worker.postMessage({ type: 'track', id: catalog.ids[selected] }); }, 30000);
+setInterval(() => { if (selected >= 0) worker.postMessage({ type: 'track', id: catalog.ids[selected], t: simNow() }); }, 10000);
+
+function setRate(rate) {
+  const live = rate === 1;
+  simClock = { anchorReal: Date.now(), anchorSim: live ? Date.now() : simNow(), rate, epoch: simClock.epoch + 1 };
+  snaps.length = 0; // positions now come from the new timeline
+  activeCorr = null;
+  worker.postMessage({ type: 'clock', clock: simClock });
+  if (selected >= 0) worker.postMessage({ type: 'track', id: catalog.ids[selected], t: simNow() });
+  document.querySelectorAll('#time-rate button').forEach((b) => b.classList.toggle('active', Number(b.dataset.rate) === rate));
+}
+document.querySelectorAll('#time-rate button').forEach((b) => { b.onclick = () => setRate(Number(b.dataset.rate)); });
 
 let downAt = null;
 renderer.domElement.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
@@ -472,6 +528,7 @@ function renderSelection() {
 const searchEl = $('search'), resultsEl = $('search-results');
 searchEl.addEventListener('input', () => {
   resultsEl.innerHTML = '';
+  if ($('only-matches').checked) applyFilters();
   const q = searchEl.value.trim().toUpperCase();
   if (!q || !catalog) return;
   let shown = 0;
@@ -479,7 +536,7 @@ searchEl.addEventListener('input', () => {
     if (catalog.dead[i] || !(catalog.names[i].toUpperCase().includes(q) || catalog.ids[i] === q)) continue;
     const li = document.createElement('li');
     li.textContent = catalog.names[i];
-    li.onclick = () => { select(i); flyToSatellite(i); resultsEl.innerHTML = ''; searchEl.value = ''; };
+    li.onclick = () => { select(i); flyToSatellite(i); resultsEl.innerHTML = ''; if (!$('only-matches').checked) searchEl.value = ''; };
     resultsEl.appendChild(li); shown++;
   }
 });
@@ -941,8 +998,9 @@ function frame(tNow) {
   const dt = Math.min((tNow - lastFrame) / 1000, 0.1);
   lastFrame = tNow;
   const now = Date.now();
-  if (now - lastBodies > 1000) { updateBodies(now); lastBodies = now; }
-  updateSatellites(now);
+  const sim = simNow();
+  if (simClock.rate > 1 || now - lastBodies > 1000) { updateBodies(sim); lastBodies = now; }
+  updateSatellites(sim);
   updateCamera(dt);
   updateWind(dt, now);
   controls.update();
@@ -958,7 +1016,11 @@ addEventListener('resize', () => {
   labelRenderer.setSize(innerWidth, innerHeight);
 });
 
-setInterval(() => { clock.textContent = new Date().toISOString().slice(11, 19) + ' UTC'; renderSelection(); renderFreshness(); renderWeather(); }, 500);
+setInterval(() => {
+  const t = new Date(simNow()).toISOString();
+  clock.innerHTML = simClock.rate === 1
+    ? `${t.slice(11, 19)} UTC`
+    : `${t.slice(5, 10)} ${t.slice(11, 19)} UTC<span class="rate">${simClock.rate}× sim</span>`; renderSelection(); renderFreshness(); renderWeather(); }, 500);
 
 updateBodies(Date.now());
 setScaleValue(1);

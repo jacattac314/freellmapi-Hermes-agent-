@@ -1,26 +1,38 @@
 // SGP4 propagation worker.
 //
-// Strategy for smooth motion: once per second we propagate every satellite to
-// a time ~1 s in the future and post that "snapshot" to the main thread. The
-// main thread interpolates between the two snapshots that bracket "now", so
-// rendering runs at full frame rate while SGP4 runs at 1 Hz. When new orbital
-// elements arrive, the next snapshot is flagged `corrected` and the main thread
-// eases the satellite from its old predicted path onto the new one.
+// Strategy for smooth motion: we propagate every satellite at evenly spaced
+// moments of *simulation* time, a couple of steps ahead of the clock, and post
+// each "snapshot" to the main thread, which interpolates between the two that
+// bracket the current simulation time. Rendering runs at full frame rate while
+// SGP4 runs a few times a second at most.
 //
-// Coordinates sent: Earth-fixed (ECF), in Earth radii, already mapped to
-// three.js axes (x = ECF x, y = ECF z/north, z = -ECF y).
+// Simulation time = real time when live; with time-warp it runs `rate` times
+// faster. The step between snapshots is at most 60 s of simulation time, which
+// keeps straight-line interpolation within ~4 km of the true LEO arc (well
+// under a pixel at globe scale).
+//
+// When new orbital elements arrive, the next snapshot is flagged `corrected`
+// and the main thread eases each satellite onto its new track.
+//
+// Coordinates sent: Earth-fixed (ECF), in Earth radii, mapped to three.js axes
+// (x = ECF x, y = ECF z/north, z = -ECF y).
 
 import { json2satrec } from '/vendor/satellite.js/dist/io.js';
 import { propagate, gstime } from '/vendor/satellite.js/dist/propagation.js';
 import { eciToEcf } from '/vendor/satellite.js/dist/transforms.js';
 
 const RE = 6378.137;
-const STEP_MS = 1000;
+const MU = 398600.4418;
+const MAX_SIM_STEP_MS = 60000;
 
-/** @type {{id:string, name:string, satrec:any}[]} */
 let sats = [];
 const indexById = new Map();
 let pendingCorrection = false;
+
+// Simulation clock (mirrors the main thread's).
+let clock = { anchorReal: Date.now(), anchorSim: Date.now(), rate: 1, epoch: 0 };
+const simNow = () => clock.anchorSim + (Date.now() - clock.anchorReal) * clock.rate;
+const simStep = () => Math.min(1000 * clock.rate, MAX_SIM_STEP_MS);
 let nextT = 0;
 let timer = null;
 
@@ -43,11 +55,27 @@ function parseCsv(text) {
   });
 }
 
+// Purpose from well-known names. Heuristic: CelesTrak's "active" list has no
+// purpose field, so anything unrecognised in GEO is assumed to be comms.
+const GROUP_PATTERNS = [
+  ['starlink', /^STARLINK/],
+  ['oneweb', /^ONEWEB/],
+  ['kuiper', /^KUIPER/],
+  ['gnss', /NAVSTAR|\bGPS\b|GLONASS|COSMOS 2[45]\d\d|GALILEO|GSAT0|BEIDOU|\bQZS|IRNSS|NAVIC/],
+  ['weather', /\bNOAA \d|\bGOES\b|METEOSAT|METOP|HIMAWARI|FENGYUN|\bFY-|DMSP|ELEKTRO|INSAT-3D|GK-?2A|JPSS|SUOMI|METEOR-M|\bMTG-/],
+  ['imaging', /LANDSAT|SENTINEL|WORLDVIEW|\bFLOCK|SKYSAT|PLEIADES|\bSPOT\b|RADARSAT|\bTERRA\b|\bAQUA\b|ICEYE|CAPELLA|LEMUR|\bDOVE|GAOFEN|JILIN|PELICAN|UMBRA|\bSWOT\b|KOMPSAT|CARTOSAT|RESOURCESAT/],
+  ['science', /^HST$|HUBBLE|\bTESS\b|\bSWIFT\b|FERMI|CHANDRA|NUSTAR|\bXMM|INTEGRAL|\bAGILE\b|\bNICER\b|\bIXPE\b|\bCHEOPS\b|\bHXMT\b|EINSTEIN PROBE|\bSVOM\b/],
+  ['comms', /IRIDIUM|GLOBALSTAR|ORBCOMM|INTELSAT|\bSES\b|SES-|EUTELSAT|ASTRA|INMARSAT|VIASAT|ECHOSTAR|TELESAT|\bO3B|AMAZONAS|HISPASAT|ARABSAT|TURKSAT|CHINASAT|TIANLIAN|SIRIUS|\bXM-|\bTDRS|\bANIK|NILESAT|YAMAL|EXPRESS-|\bBADR|THURAYA|SKYNET|\bWGS\b|MUOS|DIRECTV|GALAXY|JCSAT|SUPERBIRD|APSTAR|ASIASAT|MEASAT|THAICOM|KOREASAT|OPTUS|NBN|YAHSAT|HYLAS|KA-SAT|SPACEWAY|TIANTONG|LUCH/],
+];
+
 function classify(rec) {
   const n = Number(rec.MEAN_MOTION); // rev/day
   const e = Number(rec.ECCENTRICITY);
   const name = (rec.OBJECT_NAME || '').toUpperCase();
   const periodMin = 1440 / n;
+  const nRad = (n * 2 * Math.PI) / 86400;
+  const a = Math.cbrt(MU / (nRad * nRad));
+  const perigee = a * (1 - e) - RE, apogee = a * (1 + e) - RE;
   let regime;
   if (e > 0.25) regime = 'HEO';
   else if (periodMin < 128) regime = 'LEO';
@@ -55,10 +83,11 @@ function classify(rec) {
   else regime = 'MEO';
   let group = 'other';
   if (rec.NORAD_CAT_ID === '25544' || rec.NORAD_CAT_ID === '48274' || /\b(ISS|CSS|TIANHE)\b/.test(name)) group = 'station';
-  else if (name.startsWith('STARLINK')) group = 'starlink';
-  else if (name.startsWith('ONEWEB')) group = 'oneweb';
-  else if (/NAVSTAR|GPS|GLONASS|COSMOS 2[45]\d\d|GALILEO|GSAT0|BEIDOU|QZS|IRNSS/.test(name)) group = 'gnss';
-  return { regime, group, periodMin };
+  else {
+    for (const [g, re] of GROUP_PATTERNS) if (re.test(name)) { group = g; break; }
+    if (group === 'other' && regime === 'GEO') group = 'comms';
+  }
+  return { regime, group, periodMin, perigee, apogee };
 }
 
 function loadElements(csvText) {
@@ -109,7 +138,7 @@ function snapshot(t) {
   }
   const corrected = pendingCorrection;
   pendingCorrection = false;
-  postMessage({ type: 'snapshot', t, pos, corrected }, [pos.buffer]);
+  postMessage({ type: 'snapshot', t, pos, corrected, epoch: clock.epoch }, [pos.buffer]);
 }
 
 function sendCatalog() {
@@ -120,39 +149,44 @@ function sendCatalog() {
     regimes: sats.map((s) => s.regime),
     groups: sats.map((s) => s.group),
     periods: sats.map((s) => s.periodMin),
+    perigees: sats.map((s) => s.perigee),
+    apogees: sats.map((s) => s.apogee),
     epochs: sats.map((s) => s.epoch),
     dead: sats.map((s) => s.dead),
   });
 }
 
-function start() {
-  if (timer) return;
-  const now = Date.now();
-  nextT = Math.floor(now / STEP_MS) * STEP_MS;
+function restart() {
+  if (timer) clearInterval(timer);
+  if (!sats.length) { timer = null; return; }
+  const step = simStep();
+  nextT = Math.floor(simNow() / step) * step;
   snapshot(nextT);
-  snapshot(nextT + STEP_MS);
-  snapshot(nextT + 2 * STEP_MS);
-  nextT += 2 * STEP_MS;
+  snapshot(nextT + step);
+  snapshot(nextT + 2 * step);
+  nextT += 2 * step;
+  const realStep = step / clock.rate;
   timer = setInterval(() => {
-    // Stay ~2 steps ahead of wall-clock time; resync if the tab was throttled.
-    const target = Date.now() + 2 * STEP_MS;
-    if (target - nextT > 10 * STEP_MS) nextT = Math.floor(Date.now() / STEP_MS) * STEP_MS;
-    while (nextT < target) { nextT += STEP_MS; snapshot(nextT); }
-  }, STEP_MS / 2);
+    // Stay ~2 steps ahead of simulation time; resync if the tab was throttled.
+    const st = simStep();
+    const target = simNow() + 2 * st;
+    if (target - nextT > 10 * st) nextT = Math.floor(simNow() / st) * st;
+    while (nextT < target) { nextT += st; snapshot(nextT); }
+  }, Math.max(50, realStep / 2));
 }
 
 // Full orbit ring for a selected satellite: one period sampled in the inertial
-// frame, drawn at the current Earth orientation so it reads as a closed loop.
-function track(id, samples = 240) {
+// frame, drawn at the Earth's orientation at time `t` so it reads as a closed loop.
+function track(id, t, samples = 240) {
   const i = indexById.get(id);
   if (i === undefined) return;
   const s = sats[i];
-  const now = new Date();
-  const gmst = gstime(now);
+  const start = new Date(t);
+  const gmst = gstime(start);
   const pts = new Float32Array(samples * 3);
   const periodMs = Math.min(s.periodMin, 1600) * 60000;
   for (let k = 0; k < samples; k++) {
-    const p = positionAt(s.satrec, new Date(now.getTime() + (k / (samples - 1)) * periodMs), gmst);
+    const p = positionAt(s.satrec, new Date(t + (k / (samples - 1)) * periodMs), gmst);
     if (p) pts.set(p, k * 3);
   }
   postMessage({ type: 'track', id, pts }, [pts.buffer]);
@@ -166,8 +200,11 @@ onmessage = (e) => {
     sendCatalog();
     postMessage({ type: 'loaded', ...stats, total: sats.length });
     if (hadSats) pendingCorrection = true;
-    start();
+    else restart();
+  } else if (msg.type === 'clock') {
+    clock = msg.clock;
+    restart();
   } else if (msg.type === 'track') {
-    track(msg.id);
+    track(msg.id, msg.t ?? simNow());
   }
 };
