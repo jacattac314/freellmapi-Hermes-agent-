@@ -311,8 +311,8 @@ function updateSatellites(now) {
   }
   posAttr.needsUpdate = true;
   if (issIndex >= 0) {
-    const p = issMarker.geometry.attributes.position;
-    p.array.set(arr.subarray(issIndex * 3, issIndex * 3 + 3)); p.needsUpdate = true;
+    // Move the object itself (its vertex stays at 0,0,0) so the attached label follows.
+    issMarker.position.set(arr[issIndex * 3], arr[issIndex * 3 + 1], arr[issIndex * 3 + 2]);
     issMarker.visible = visible[issIndex] === 1;
   }
   if (selected >= 0) {
