@@ -751,7 +751,17 @@ function renderFreshness() {
 
 let demoShown = false;
 function noteDemo(res) {
-  if (!demoShown && res.headers.get('X-Demo') === '1') { demoShown = true; $('demo-banner').hidden = false; document.body.classList.add('demo'); }
+  const mode = res.headers.get('X-Demo');
+  if (demoShown || (mode !== '1' && mode !== 'snapshot')) return;
+  demoShown = true;
+  if (mode === 'snapshot') {
+    // Real data bundled into the page at publish time (no live fetching available).
+    const at = new Date(Number(res.headers.get('X-Fetched-At'))).toISOString().replace('T', ' ').slice(0, 16);
+    $('demo-banner').textContent = `REAL DATA SNAPSHOT · ${at} UTC · satellites move live from real orbits; space weather is frozen at this time`;
+    $('demo-banner').classList.add('snapshot');
+  }
+  $('demo-banner').hidden = false;
+  document.body.classList.add('demo');
 }
 
 // ------------------------------------------------------- ISS live telemetry

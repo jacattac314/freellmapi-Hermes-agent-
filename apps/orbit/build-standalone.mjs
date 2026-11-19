@@ -46,12 +46,35 @@ main = must(main,
 
 const demo = read('demo-data.js').replaceAll('export function', 'function');
 
+// SNAPSHOT_DIR=<dir with gp.csv, wind.json, mag.json, xray.json, aurora.json, fetched-at.txt>
+// bundles real data beside the page instead of synthetic data. Files are
+// written next to the output HTML and fetched by relative URL.
+const SNAP = process.env.SNAPSHOT_DIR;
+const SNAP_FILES = { gp: 'data-gp.csv', wind: 'data-wind.json', mag: 'data-mag.json', xray: 'data-xray.json', aurora: 'data-aurora.json' };
+let snapAt = 0;
+if (SNAP) {
+  snapAt = Number(fs.readFileSync(path.join(SNAP, 'fetched-at.txt'), 'utf8'));
+  const outDir = path.dirname(out);
+  const src = { gp: 'gp.csv', wind: 'wind.json', mag: 'mag.json', xray: 'xray.json', aurora: 'aurora.json' };
+  for (const [k, f] of Object.entries(src)) {
+    let body = fs.readFileSync(path.join(SNAP, f), 'utf8');
+    if (k === 'wind' || k === 'mag') { // keep the last 4 hours: enough for the L1→Earth stream
+      const rows = JSON.parse(body);
+      const newest = Math.max(...rows.map((r) => Date.parse(r.time_tag + 'Z')));
+      body = JSON.stringify(rows.filter((r) => Date.parse(r.time_tag + 'Z') > newest - 4 * 3600e3));
+    }
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, SNAP_FILES[k]), body);
+  }
+}
+
 // In-page stand-in for the server's /api/data/* routes and the coastline file.
 const shim = `
 ${demo}
 const LAND_TOPO = ${land};
 const WORKER_SRC = ${JSON.stringify(worker)};
 const realFetch = window.fetch.bind(window);
+const SNAPSHOT = ${SNAP ? JSON.stringify({ at: snapAt, files: SNAP_FILES }) : 'null'};
 const demoCache = {};
 window.fetch = async (url, opts) => {
   const u = String(url);
@@ -59,6 +82,10 @@ window.fetch = async (url, opts) => {
   const m = u.match(/\\/api\\/data\\/(\\w+)$/);
   if (!m) return realFetch(url, opts);
   const key = m[1];
+  if (SNAPSHOT) {
+    const r = await realFetch(SNAPSHOT.files[key]);
+    return new Response(await r.text(), { status: r.status, headers: { 'X-Fetched-At': String(SNAPSHOT.at), 'X-Demo': 'snapshot', 'X-Upstream-Error': '' } });
+  }
   const ttl = key === 'gp' ? 7200000 : key === 'aurora' ? 300000 : 60000;
   let c = demoCache[key];
   if (!c || Date.now() - c.at > ttl) {
