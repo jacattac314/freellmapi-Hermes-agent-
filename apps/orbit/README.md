@@ -10,6 +10,13 @@ npm run orbit                    # live data  → http://localhost:4300
 npm run orbit:demo               # synthetic data (offline), red DEMO banner shown
 ```
 
+To try it without the server (e.g. on a phone), build a single self-contained page
+that runs on demo data and loads its libraries from jsDelivr:
+
+```bash
+node apps/orbit/build-standalone.mjs     # → apps/orbit/dist/orbit-demo.html
+```
+
 No API keys needed. Data is fetched by the local server and cached in `apps/orbit/.cache/`.
 
 ## What you're looking at

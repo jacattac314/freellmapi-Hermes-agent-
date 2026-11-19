@@ -376,6 +376,17 @@ function applyFilters() {
   $('sat-count').textContent = `${count.toLocaleString()} of ${N.toLocaleString()} objects`;
 }
 
+// Phone layout: panels are sheets toggled from the top bar.
+function showPanel(side) {
+  const other = side === 'left' ? 'right' : 'left';
+  document.body.classList.remove(`show-${other}`);
+  $(`toggle-${other}`).classList.remove('active');
+  const on = document.body.classList.toggle(`show-${side}`);
+  $(`toggle-${side}`).classList.toggle('active', on);
+}
+$('toggle-left').onclick = () => showPanel('left');
+$('toggle-right').onclick = () => showPanel('right');
+
 $('layer-rings').addEventListener('change', (e) => { geoRing.visible = e.target.checked; });
 $('layer-labels').addEventListener('change', () => updateLabelVisibility());
 
@@ -410,6 +421,7 @@ function select(i) {
   if (i < 0) { $('selection').hidden = true; selMarker.visible = false; return; }
   $('selection').hidden = false;
   $('sel-name').textContent = catalog.names[i];
+  if (innerWidth <= 820 && !document.body.classList.contains('show-right')) showPanel('right');
   worker.postMessage({ type: 'track', id: catalog.ids[i] });
 }
 $('sel-clear').onclick = () => select(-1);
