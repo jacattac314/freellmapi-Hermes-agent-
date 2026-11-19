@@ -50,13 +50,14 @@ const demo = read('demo-data.js').replaceAll('export function', 'function');
 // bundles real data beside the page instead of synthetic data. Files are
 // written next to the output HTML and fetched by relative URL.
 const SNAP = process.env.SNAPSHOT_DIR;
-const SNAP_FILES = { gp: 'data-gp.csv', wind: 'data-wind.json', mag: 'data-mag.json', xray: 'data-xray.json', aurora: 'data-aurora.json' };
+const SNAP_FILES = { gp: 'data-gp.csv', debris: 'data-debris.csv', wind: 'data-wind.json', mag: 'data-mag.json', xray: 'data-xray.json', aurora: 'data-aurora.json' };
 let snapAt = 0;
 if (SNAP) {
   snapAt = Number(fs.readFileSync(path.join(SNAP, 'fetched-at.txt'), 'utf8'));
   const outDir = path.dirname(out);
-  const src = { gp: 'gp.csv', wind: 'wind.json', mag: 'mag.json', xray: 'xray.json', aurora: 'aurora.json' };
+  const src = { gp: 'gp.csv', debris: 'debris.csv', wind: 'wind.json', mag: 'mag.json', xray: 'xray.json', aurora: 'aurora.json' };
   for (const [k, f] of Object.entries(src)) {
+    if (!fs.existsSync(path.join(SNAP, f))) { delete SNAP_FILES[k]; continue; } // optional layers
     let body = fs.readFileSync(path.join(SNAP, f), 'utf8');
     if (k === 'wind' || k === 'mag') { // keep the last 4 hours: enough for the L1→Earth stream
       const rows = JSON.parse(body);
@@ -72,6 +73,7 @@ if (SNAP) {
 const shim = `
 ${demo}
 const LAND_TOPO = ${land};
+const STARS = ${read('public/stars.json')};
 const WORKER_SRC = ${JSON.stringify(worker)};
 const realFetch = window.fetch.bind(window);
 const SNAPSHOT = ${SNAP ? JSON.stringify({ at: snapAt, files: SNAP_FILES }) : 'null'};
@@ -79,9 +81,11 @@ const demoCache = {};
 window.fetch = async (url, opts) => {
   const u = String(url);
   if (u.endsWith('land-110m.json')) return new Response(JSON.stringify(LAND_TOPO), { headers: { 'Content-Type': 'application/json' } });
+  if (u.endsWith('/stars.json')) return new Response(JSON.stringify(STARS), { headers: { 'Content-Type': 'application/json' } });
   const m = u.match(/\\/api\\/data\\/(\\w+)$/);
   if (!m) return realFetch(url, opts);
   const key = m[1];
+  if (key === 'debris' && !(SNAPSHOT && SNAPSHOT.files.debris)) return new Response('', { status: 404 });
   if (SNAPSHOT) {
     const r = await realFetch(SNAPSHOT.files[key]);
     return new Response(await r.text(), { status: r.status, headers: { 'X-Fetched-At': String(SNAPSHOT.at), 'X-Demo': 'snapshot', 'X-Upstream-Error': '' } });

@@ -2,14 +2,13 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import { gstime } from '/vendor/satellite.js/dist/propagation.js';
-import { eciToEcf } from '/vendor/satellite.js/dist/transforms.js';
-import { sunPos } from '/vendor/satellite.js/dist/sun.js';
-import { jday } from '/vendor/satellite.js/dist/ext.js';
+import { eciToGeodetic } from '/vendor/satellite.js/dist/transforms.js';
 
-// Units: 1 scene unit = 1 Earth radius. Frame: Earth-fixed (ECF), three.js
-// Y-up, so x = ECF x, y = ECF z (north), z = -ECF y.
+// Units: 1 scene unit = 1 Earth radius. Frame: inertial, Earth-centred
+// (equatorial, J2000/TEME — the difference is invisible here), three.js Y-up:
+// x = ECI x, y = ECI z (north), z = -ECI y. The globe rotates by sidereal time,
+// so satellites, the Moon, the Sun and the planets all keep their true motion.
 const RE_KM = 6378.137;
-const OMEGA_EARTH = 7.2921159e-5; // rad/s
 const CORR_MS = 5000; // how long an orbit-update correction takes to ease in
 const $ = (id) => document.getElementById(id);
 const toThree = (v) => new THREE.Vector3(v.x, v.z, -v.y);
@@ -33,37 +32,69 @@ Object.assign(labelRenderer.domElement.style, { position: 'absolute', top: '0', 
 container.appendChild(labelRenderer.domElement);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.001, 200000);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.001, 1e9);
 camera.position.set(2.2, 1.6, 2.6);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.minDistance = 1.15;
-controls.maxDistance = 1500;
+controls.maxDistance = 3e6;
 controls.enablePan = false;
 
 scene.add(new THREE.AmbientLight(0x334466, 0.35));
 const sunLight = new THREE.DirectionalLight(0xffffff, 2.2);
 scene.add(sunLight);
 
-// Stars
-{
-  const n = 3000, pos = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) {
-    const v = new THREE.Vector3().randomDirection().multiplyScalar(80000);
-    pos.set([v.x, v.y, v.z], i * 3);
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8899bb, size: 1.2, sizeAttenuation: false })));
-}
+const dotTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 32;
+  const g = c.getContext('2d'); g.fillStyle = '#fff'; g.beginPath(); g.arc(16, 16, 14, 0, Math.PI * 2); g.fill();
+  return new THREE.CanvasTexture(c);
+})();
 
-// Earth
+// Real star field: ~5,000 naked-eye stars (Hipparcos via d3-celestial), on a
+// sky sphere that travels with the camera so it stays at "infinity".
+const sky = new THREE.Group();
+scene.add(sky);
+const raDecToVec = (ra, dec, r) => {
+  const a = THREE.MathUtils.degToRad(ra), d = THREE.MathUtils.degToRad(dec);
+  return new THREE.Vector3(r * Math.cos(d) * Math.cos(a), r * Math.sin(d), -r * Math.cos(d) * Math.sin(a));
+};
+function bvColour(bv, out) { // B-V colour index → approximate star colour
+  const t = THREE.MathUtils.clamp((bv + 0.4) / 2.4, 0, 1);
+  return out.setRGB(0.62 + 0.38 * Math.min(1, t * 2), 0.72 + 0.28 * (1 - Math.abs(t - 0.35) * 1.4), 1 - 0.75 * Math.max(0, t - 0.25));
+}
+fetch('/stars.json').then((r) => r.json()).then(({ stars }) => {
+  // four magnitude bands so bright stars draw larger
+  const bands = [[-2, 1.5, 3.6], [1.5, 3, 2.6], [3, 4.5, 1.8], [4.5, 7, 1.2]];
+  const c = new THREE.Color();
+  for (const [lo, hi, size] of bands) {
+    const pos = [], col = [];
+    for (const [ra, dec, mag, bv] of stars) {
+      if (mag < lo || mag >= hi) continue;
+      const v = raDecToVec(ra, dec, 5e7);
+      pos.push(v.x, v.y, v.z);
+      bvColour(bv, c);
+      const k = THREE.MathUtils.clamp(1.25 - (mag - lo) * 0.25, 0.45, 1);
+      col.push(c.r * k, c.g * k, c.b * k);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    const pts = new THREE.Points(g, new THREE.PointsMaterial({ size, sizeAttenuation: false, vertexColors: true, map: dotTex, transparent: true, depthWrite: false }));
+    pts.frustumCulled = false;
+    sky.add(pts);
+  }
+}).catch((e) => console.warn('stars', e));
+
+// Earth. Everything fixed to the ground lives in earthGroup, rotated by
+// Greenwich sidereal time.
+const earthGroup = new THREE.Group();
+scene.add(earthGroup);
 const earth = new THREE.Mesh(
   new THREE.SphereGeometry(1, 96, 64),
   new THREE.MeshPhongMaterial({ color: 0x0e2f55, emissive: 0x020812, shininess: 12, specular: 0x223344 }),
 );
-scene.add(earth);
+earthGroup.add(earth);
 
 // Atmosphere rim glow
 scene.add(new THREE.Mesh(
@@ -86,7 +117,7 @@ function lonLatToVec(lon, lat, r = 1) {
   const pts = [];
   for (let lat = -60; lat <= 60; lat += 30) for (let lon = 0; lon < 360; lon += 2) pts.push(lonLatToVec(lon, lat, 1.001), lonLatToVec(lon + 2, lat, 1.001));
   for (let lon = 0; lon < 360; lon += 30) for (let lat = -88; lat < 88; lat += 2) pts.push(lonLatToVec(lon, lat, 1.001), lonLatToVec(lon, lat + 2, 1.001));
-  scene.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
+  earthGroup.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
     new THREE.LineBasicMaterial({ color: 0x1d4a7a, transparent: true, opacity: 0.35 })));
 }
 
@@ -97,7 +128,7 @@ fetch('/vendor/world-atlas/land-110m.json').then((r) => r.json()).then((topo) =>
   for (const line of mesh.coordinates) {
     for (let i = 0; i < line.length - 1; i++) pts.push(lonLatToVec(...line[i], 1.0015), lonLatToVec(...line[i + 1], 1.0015));
   }
-  scene.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
+  earthGroup.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
     new THREE.LineBasicMaterial({ color: 0x5fb3ea, transparent: true, opacity: 0.75 })));
 }).catch((e) => console.warn('coastlines', e));
 
@@ -132,11 +163,16 @@ function glowTexture(inner, outer) {
   g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
   return new THREE.CanvasTexture(c);
 }
+// The Sun, at its true distance and size (radius 109 Earth radii), plus a glow.
+const solarGroup = new THREE.Group(); // heliocentric frame, positioned at the Sun
+scene.add(solarGroup);
+const sunBody = new THREE.Mesh(new THREE.SphereGeometry(696000 / RE_KM, 48, 32), new THREE.MeshBasicMaterial({ color: 0xfff1c9 }));
+solarGroup.add(sunBody);
 const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture('rgba(255,244,214,1)', 'rgba(255,200,80,0)'), depthWrite: false, blending: THREE.AdditiveBlending }));
-sunSprite.scale.setScalar(160);
-const sunLabel = makeLabel('Sun <small>direction · not to scale</small>');
-sunSprite.add(sunLabel);
-scene.add(sunSprite);
+sunSprite.scale.setScalar(1400);
+solarGroup.add(sunSprite);
+const sunLabel = makeLabel('Sun');
+solarGroup.add(sunLabel);
 
 // L1 — where ACE / DSCOVR measure the solar wind before it reaches Earth
 const L1_R = 1.5e6 / RE_KM;
@@ -163,27 +199,100 @@ function moonEci(date) {
 const sunDir = new THREE.Vector3(1, 0, 0);
 const earthLabel = makeLabel('Earth');
 earth.add(earthLabel);
+
+// --------------------------------------------------------------- planets
+// JPL "Keplerian Elements for Approximate Positions of the Major Planets"
+// (Standish; valid 1800–2050, errors of arcminutes): a [AU], e, I, L, ϖ, Ω [deg]
+// at J2000 and their rates per Julian century. "Earth" is the Earth–Moon barycentre.
+const AU_RE = 149597870.7 / RE_KM;
+const PLANETS = [
+  { name: 'Mercury', color: 0xb5a998, r: 2439.7, el: [0.38709927, 0.20563593, 7.00497902, 252.25032350, 77.45779628, 48.33076593], rt: [0.00000037, 0.00001906, -0.00594749, 149472.67411175, 0.16047689, -0.12534081] },
+  { name: 'Venus', color: 0xf2d39b, r: 6051.8, el: [0.72333566, 0.00677672, 3.39467605, 181.97909950, 131.60246718, 76.67984255], rt: [0.00000390, -0.00004107, -0.00078890, 58517.81538729, 0.00268329, -0.27769418] },
+  { name: 'Earth', color: 0x6cc4ff, r: 6371, el: [1.00000261, 0.01671123, -0.00001531, 100.46457166, 102.93768193, 0], rt: [0.00000562, -0.00004392, -0.01294668, 35999.37244981, 0.32327364, 0] },
+  { name: 'Mars', color: 0xe07a4f, r: 3389.5, el: [1.52371034, 0.09339410, 1.84969142, -4.55343205, -23.94362959, 49.55953891], rt: [0.00001847, 0.00007882, -0.00813131, 19140.30268499, 0.44441088, -0.29257343] },
+  { name: 'Jupiter', color: 0xd9b38c, r: 69911, el: [5.20288700, 0.04838624, 1.30439695, 34.39644051, 14.72847983, 100.47390909], rt: [-0.00011607, -0.00013253, -0.00183714, 3034.74612775, 0.21252668, 0.20469106] },
+  { name: 'Saturn', color: 0xe8d29a, r: 58232, el: [9.53667594, 0.05386179, 2.48599187, 49.95424423, 92.59887831, 113.66242448], rt: [-0.00125060, -0.00050991, 0.00193609, 1222.49362201, -0.41897216, -0.28867794] },
+  { name: 'Uranus', color: 0x9fe3e6, r: 25362, el: [19.18916464, 0.04725744, 0.77263783, 313.23810451, 170.95427630, 74.01692503], rt: [-0.00196176, -0.00004397, -0.00242939, 428.48202785, 0.40805281, 0.04240589] },
+  { name: 'Neptune', color: 0x6f8fff, r: 24622, el: [30.06992276, 0.00859048, 1.77004347, -55.12002969, 44.96476227, 131.78422574], rt: [0.00026291, 0.00005105, 0.00035372, 218.45945325, -0.32241464, -0.00508664] },
+];
+const D2R = Math.PI / 180, OBLIQ = 23.43928 * D2R;
+// Heliocentric position, ecliptic J2000, in AU. `meanAnomalyOffset` (deg) samples the orbit.
+function planetHelio(p, T, meanAnomalyOffset = 0) {
+  const [a, e, I, L, wbar, node] = p.el.map((v, i) => v + p.rt[i] * T);
+  const w = (wbar - node) * D2R, O = node * D2R, inc = I * D2R;
+  let M = ((L - wbar + meanAnomalyOffset) % 360 + 540) % 360 - 180;
+  M *= D2R;
+  let E = M + e * Math.sin(M);
+  for (let k = 0; k < 8; k++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+  const xp = a * (Math.cos(E) - e), yp = a * Math.sqrt(1 - e * e) * Math.sin(E);
+  const cw = Math.cos(w), sw = Math.sin(w), cO = Math.cos(O), sO = Math.sin(O), cI = Math.cos(inc), sI = Math.sin(inc);
+  return {
+    x: (cw * cO - sw * sO * cI) * xp + (-sw * cO - cw * sO * cI) * yp,
+    y: (cw * sO + sw * cO * cI) * xp + (-sw * sO + cw * cO * cI) * yp,
+    z: (sw * sI) * xp + (cw * sI) * yp,
+  };
+}
+// Ecliptic J2000 → ecliptic of date (precession in longitude, ~50"/yr, so the
+// planets line up with the satellites' frame of date) → equatorial → scene
+// axes, scaled from AU to Earth radii.
+let precessionRad = 0;
+function eclToScene(v, out = new THREE.Vector3()) {
+  const c = Math.cos(precessionRad), sn = Math.sin(precessionRad);
+  const x = v.x * c - v.y * sn, y = v.x * sn + v.y * c;
+  const ye = y * Math.cos(OBLIQ) - v.z * Math.sin(OBLIQ), ze = y * Math.sin(OBLIQ) + v.z * Math.cos(OBLIQ);
+  return out.set(x, ze, -ye).multiplyScalar(AU_RE);
+}
+const julianCenturies = (t) => (t / 86400000 + 2440587.5 - 2451545.0) / 36525;
+precessionRad = 1.396971 * julianCenturies(Date.now()) * D2R; // general precession, deg per century
+for (const p of PLANETS) {
+  // Orbit line, in the heliocentric group.
+  const T0 = julianCenturies(Date.now());
+  const pts = Array.from({ length: 361 }, (_, k) => eclToScene(planetHelio(p, T0, k)));
+  p.orbit = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: p.color, transparent: true, opacity: p.name === 'Earth' ? 0.45 : 0.3 }));
+  p.orbit.frustumCulled = false;
+  solarGroup.add(p.orbit);
+  if (p.name === 'Earth') continue; // Earth itself is the globe at the origin
+  p.obj = new THREE.Group();
+  p.obj.add(new THREE.Mesh(new THREE.SphereGeometry(p.r / RE_KM, 32, 24), new THREE.MeshPhongMaterial({ color: p.color })));
+  const marker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+    new THREE.PointsMaterial({ color: p.color, size: 7, sizeAttenuation: false, map: dotTex, alphaTest: 0.5, transparent: true }));
+  marker.frustumCulled = false;
+  p.obj.add(marker);
+  p.label = makeLabel(p.name);
+  p.obj.add(p.label);
+  solarGroup.add(p.obj);
+}
+// Earth's own marker for solar-system scales (the globe is far too small to see).
+const earthMarker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+  new THREE.PointsMaterial({ color: 0x6cc4ff, size: 7, sizeAttenuation: false, map: dotTex, alphaTest: 0.5, transparent: true }));
+earthMarker.frustumCulled = false;
+scene.add(earthMarker);
+
+let currentGmst = 0;
+const sunScene = new THREE.Vector3(); // the Sun's position relative to Earth, scene units
+const tmpV = new THREE.Vector3();
 function updateBodies(now) {
   const date = new Date(now);
-  const gmst = gstime(date);
-  const s = sunPos(jday(date)).rsun;
-  sunDir.copy(toThree(eciToEcf(s, gmst))).normalize();
+  currentGmst = gstime(date);
+  earthGroup.rotation.y = currentGmst;
+  const T = julianCenturies(now);
+  precessionRad = 1.396971 * T * D2R;
+  const earthHelio = eclToScene(planetHelio(PLANETS[2], T), tmpV);
+  sunScene.copy(earthHelio).negate();
+  solarGroup.position.copy(sunScene);
+  sunDir.copy(sunScene).normalize();
+  for (const p of PLANETS) if (p.obj) eclToScene(planetHelio(p, T), p.obj.position);
   sunLight.position.copy(sunDir).multiplyScalar(50);
-  sunSprite.position.copy(sunDir).multiplyScalar(3000);
   l1.position.copy(sunDir).multiplyScalar(L1_R);
   sunLine.geometry.setFromPoints([sunDir.clone().multiplyScalar(1.05), sunDir.clone().multiplyScalar(L1_R)]);
   sunLine.computeLineDistances();
-  const m = eciToEcf(moonEci(date), gmst);
-  moon.position.copy(toThree(m)).divideScalar(RE_KM);
+  moon.position.copy(toThree(moonEci(date))).divideScalar(RE_KM);
 }
 
 // ------------------------------------------------------------- satellites
 const REGIME_COLOR = { LEO: 0x4fc3f7, MEO: 0xffd54f, GEO: 0xff8a65, HEO: 0xce93d8 };
-const dotTex = (() => {
-  const c = document.createElement('canvas'); c.width = c.height = 32;
-  const g = c.getContext('2d'); g.fillStyle = '#fff'; g.beginPath(); g.arc(16, 16, 14, 0, Math.PI * 2); g.fill();
-  return new THREE.CanvasTexture(c);
-})();
+
 
 let catalog = null; // { ids, names, regimes, groups, periods, epochs, dead }
 let N = 0;
@@ -230,7 +339,7 @@ function buildSatGeometry() {
   const col = new Float32Array(N * 3);
   const c = new THREE.Color();
   for (let i = 0; i < N; i++) {
-    c.setHex(catalog.groups[i] === 'station' ? 0xffffff : REGIME_COLOR[catalog.regimes[i]] ?? 0xaaaaaa);
+    c.setHex(catalog.groups[i] === 'station' ? 0xffffff : catalog.groups[i] === 'debris' ? 0xb07a7a : REGIME_COLOR[catalog.regimes[i]] ?? 0xaaaaaa);
     col.set([c.r, c.g, c.b], i * 3);
   }
   satGeom.setAttribute('color', new THREE.BufferAttribute(col, 3));
@@ -290,7 +399,7 @@ let correctionsApplied = 0;
 const satPos = (i, out) => out.set(posAttr.array[i * 3], posAttr.array[i * 3 + 1], posAttr.array[i * 3 + 2]);
 
 function updateSatellites(now) {
-  if (!posAttr || snaps.length === 0) return;
+  if (!posAttr || snaps.length === 0 || simClock.rate > MAX_SAT_RATE) return;
   let A, B;
   for (let i = 0; i < snaps.length - 1; i++) if (snaps[i].t <= now && now < snaps[i + 1].t) { A = snaps[i]; B = snaps[i + 1]; }
   if (!A) { // worker behind (throttled tab) or not started: extrapolate from the newest pair
@@ -324,8 +433,6 @@ function updateSatellites(now) {
     const pa = new THREE.Vector3(adj(A, k, wA), adj(A, k + 1, wA), adj(A, k + 2, wA));
     const pb = new THREE.Vector3(adj(B, k, wB), adj(B, k + 1, wB), adj(B, k + 2, wB));
     selVel.copy(pb).sub(pa).multiplyScalar(RE_KM / (span / 1000 || 1));
-    const r = new THREE.Vector3(arr[k], arr[k + 1], arr[k + 2]).multiplyScalar(RE_KM);
-    selVel.add(new THREE.Vector3(OMEGA_EARTH * r.z, 0, -OMEGA_EARTH * r.x));
   }
 }
 
@@ -350,6 +457,18 @@ worker.onmessage = (e) => {
 };
 
 let lastGpFetchedAt = 0;
+let lastDebrisFetchedAt = 0;
+async function pollDebris() {
+  // Optional: debris clouds from four break-ups (ASAT tests, collision). Absent → skipped.
+  try {
+    const res = await fetch('/api/data/debris');
+    if (!res.ok) return;
+    const fetchedAt = Number(res.headers.get('X-Fetched-At'));
+    if (fetchedAt === lastDebrisFetchedAt) return;
+    lastDebrisFetchedAt = fetchedAt;
+    worker.postMessage({ type: 'elements', csv: await res.text(), source: 'debris' });
+  } catch { /* optional layer */ }
+}
 async function pollCatalog() {
   try {
     const res = await fetch('/api/data/gp');
@@ -360,8 +479,9 @@ async function pollCatalog() {
     if (fetchedAt !== lastGpFetchedAt) {
       lastGpFetchedAt = fetchedAt;
       freshness.gp = fetchedAt;
-      worker.postMessage({ type: 'elements', csv: await res.text() });
+      worker.postMessage({ type: 'elements', csv: await res.text(), source: 'active' });
     }
+    pollDebris();
   } catch (err) {
     freshness.gpError = String(err.message || err);
   }
@@ -373,6 +493,7 @@ const GROUPS = [
   ['station', 'Crewed stations'], ['starlink', 'Starlink'], ['oneweb', 'OneWeb'], ['kuiper', 'Amazon Kuiper'],
   ['gnss', 'Navigation (GPS, Galileo…)'], ['weather', 'Weather'], ['imaging', 'Earth imaging'],
   ['science', 'Science & telescopes'], ['comms', 'Communications'], ['other', 'Everything else'],
+  ['debris', 'Debris clouds'],
 ];
 const groupOn = Object.fromEntries(GROUPS.map(([g]) => [g, true]));
 document.querySelectorAll('[data-regime]').forEach((el) => el.addEventListener('change', () => { regimeOn[el.dataset.regime] = el.checked; applyFilters(); }));
@@ -447,7 +568,7 @@ function pick(clientX, clientY) {
   pointer.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
   raycaster.setFromCamera(pointer, camera);
   // Threshold in world units ≈ 6 px at the satellite's distance
-  raycaster.params.Points.threshold = camera.position.length() * 0.008;
+  raycaster.params.Points.threshold = camera.position.distanceTo(controls.target) * 0.008;
   const hits = raycaster.intersectObject(satPoints);
   const earthHit = raycaster.intersectObject(earth)[0];
   for (const h of hits) {
@@ -473,8 +594,14 @@ $('sel-clear').onclick = () => select(-1);
 $('sel-follow').onclick = () => { following = !following; $('sel-follow').classList.toggle('active', following); };
 setInterval(() => { if (selected >= 0) worker.postMessage({ type: 'track', id: catalog.ids[selected], t: simNow() }); }, 10000);
 
+const MAX_SAT_RATE = 3600; // above this the worker pauses satellites
 function setRate(rate) {
   const live = rate === 1;
+  const paused = rate > MAX_SAT_RATE;
+  if (satPoints) satPoints.visible = !paused;
+  issMarker.visible = issMarker.visible && !paused;
+  selMarker.visible = selMarker.visible && !paused;
+  trackLine.visible = trackLine.visible && !paused;
   simClock = { anchorReal: Date.now(), anchorSim: live ? Date.now() : simNow(), rate, epoch: simClock.epoch + 1 };
   snaps.length = 0; // positions now come from the new timeline
   activeCorr = null;
@@ -483,6 +610,7 @@ function setRate(rate) {
   document.querySelectorAll('#time-rate button').forEach((b) => b.classList.toggle('active', Number(b.dataset.rate) === rate));
 }
 document.querySelectorAll('#time-rate button').forEach((b) => { b.onclick = () => setRate(Number(b.dataset.rate)); });
+function rateLabel(r) { return r >= 86400 ? `${r / 86400} d/s` : `${r}×`; }
 
 let downAt = null;
 renderer.domElement.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
@@ -508,10 +636,11 @@ renderer.domElement.addEventListener('pointermove', (e) => {
 function renderSelection() {
   if (selected < 0) return;
   const p = new THREE.Vector3(); satPos(selected, p);
-  const alt = p.length() * RE_KM - RE_KM;
-  // geodetic-ish lat/lon (spherical; fine for display)
-  const lat = THREE.MathUtils.radToDeg(Math.asin(p.y / p.length()));
-  const lon = THREE.MathUtils.radToDeg(Math.atan2(-p.z, p.x));
+  // Scene axes → ECI km → geodetic (WGS-72 ellipsoid, as SGP4 uses).
+  const g = eciToGeodetic({ x: p.x * RE_KM, y: -p.z * RE_KM, z: p.y * RE_KM }, currentGmst);
+  const alt = g.height;
+  const lat = THREE.MathUtils.radToDeg(g.latitude);
+  const lon = THREE.MathUtils.radToDeg(g.longitude);
   const epoch = new Date(catalog.epochs[selected].endsWith('Z') ? catalog.epochs[selected] : catalog.epochs[selected] + 'Z');
   const ageH = (Date.now() - epoch.getTime()) / 3600000;
   $('sel-body').innerHTML = `
@@ -559,9 +688,13 @@ const STOPS = [
   { name: 'Geostationary belt', dist: 19, desc: 'GEO ring at 35,786 km. The cyan shell is the magnetopause, where Earth\'s magnetic field holds off the solar wind; it shrinks when wind pressure rises.' },
   { name: 'Earth–Moon', dist: 150, desc: 'The Moon at ~384,000 km (60 Earth radii). Satellites collapse into a speck at this scale. Moon position: low-precision ephemeris.' },
   { name: 'Sun–Earth L1', dist: 800, desc: '1.5 million km sunward: ACE and DSCOVR measure the solar wind here. The stream shows the last hour of those measurements on its way to Earth, coloured by speed.' },
+  { name: 'Inner solar system', dist: 1.3e5, desc: 'Mercury, Venus, Earth and Mars where they are today, from NASA JPL orbital elements. Earth is 1 AU (150 million km) from the Sun; light takes 8 minutes to cross it.' },
+  { name: 'Outer solar system', dist: 2.4e6, desc: 'Jupiter to Neptune. Neptune is 30 AU out, over 4 light-hours. Try 30 d/s to watch the inner planets lap the outer ones.' },
 ];
+STOPS.forEach((st, i) => { st.short = ['Surface', 'LEO', 'Nav sats', 'GEO', 'Moon', 'L1', 'Inner planets', 'Outer planets'][i]; });
 const slider = $('scale-slider');
-$('scale-ticks').innerHTML = STOPS.map((s, i) => `<span data-i="${i}" style="left:${(i / (STOPS.length - 1)) * 100}%">${s.name}</span>`).join('');
+slider.max = String(STOPS.length - 1);
+$('scale-ticks').innerHTML = STOPS.map((s, i) => `<span data-i="${i}" style="left:${(i / (STOPS.length - 1)) * 100}%">${s.short}</span>`).join('');
 $('scale-ticks').querySelectorAll('span').forEach((el) => { el.onclick = () => setScaleValue(Number(el.dataset.i)); });
 
 function scaleToDist(v) {
@@ -579,15 +712,23 @@ function distToScale(d) {
 let targetDist = null; // when set, camera eases (in log space) toward it
 const camDir = new THREE.Vector3();
 let flyDir = false;
-let sideView = false;
+let viewMode = null;
+// Ecliptic north in scene axes: planets' orbits lie flat when seen from here.
+const ECL_NORTH = new THREE.Vector3(0, Math.cos(OBLIQ), Math.sin(OBLIQ));
 function setScaleValue(v) {
   slider.value = String(v); targetDist = scaleToDist(v); updateScaleText(v);
-  // At Moon / L1 scale, swing round to look side-on at the Sun–Earth line so Earth, Moon and L1 are all in frame.
-  if (v >= 3.5 && !sideView && !following) {
-    sideView = true;
+  if (following) return;
+  if (v >= 5.5 && viewMode !== 'ecliptic') {
+    // Solar system: look down on the ecliptic at a slant so orbits read as ellipses.
+    viewMode = 'ecliptic';
+    camDir.crossVectors(sunDir, ECL_NORTH).normalize().multiplyScalar(0.55).addScaledVector(ECL_NORTH, 0.85).normalize();
+    flyDir = true;
+  } else if (v >= 3.5 && v < 5.5 && viewMode !== 'side') {
+    // Moon / L1: side-on to the Sun–Earth line so Earth, Moon and L1 are all in frame.
+    viewMode = 'side';
     camDir.crossVectors(sunDir, new THREE.Vector3(0, 1, 0)).normalize().multiplyScalar(0.95).add(new THREE.Vector3(0, 0.3, 0)).normalize();
     flyDir = true;
-  } else if (v < 3.5) sideView = false;
+  } else if (v < 3.5) viewMode = null;
 }
 slider.addEventListener('input', () => setScaleValue(Number(slider.value)));
 
@@ -601,14 +742,16 @@ function updateScaleText(v) {
   $('scale-ticks').querySelectorAll('span').forEach((el, j) => el.classList.toggle('on', j === i));
 }
 
+const wantTarget = new THREE.Vector3();
 function updateCamera(dt) {
-  let dist = camera.position.length();
+  const off = camera.position.clone().sub(controls.target);
+  let dist = off.length();
   if (targetDist !== null) {
     const k = 1 - Math.exp(-dt * 4);
     dist = Math.exp(Math.log(dist) + (Math.log(targetDist) - Math.log(dist)) * k);
     if (Math.abs(Math.log(dist / targetDist)) < 0.002) { dist = targetDist; targetDist = null; }
   }
-  const dir = camera.position.clone().normalize();
+  const dir = off.normalize();
   if (following && selected >= 0) {
     const p = new THREE.Vector3(); satPos(selected, p);
     if (p.lengthSq() > 0) dir.lerp(p.normalize(), 1 - Math.exp(-dt * 3)).normalize();
@@ -616,7 +759,12 @@ function updateCamera(dt) {
     dir.lerp(camDir, 1 - Math.exp(-dt * 3)).normalize();
     if (dir.angleTo(camDir) < 0.002) flyDir = false;
   }
-  camera.position.copy(dir.multiplyScalar(dist));
+  // Centre on Earth up to L1, then glide to the Sun for the planets.
+  const scale = targetDist !== null ? Number(slider.value) : distToScale(dist);
+  wantTarget.copy(sunScene).multiplyScalar(THREE.MathUtils.smoothstep(scale, 5.15, 6));
+  controls.target.lerp(wantTarget, 1 - Math.exp(-dt * 5));
+  camera.position.copy(controls.target).addScaledVector(dir, dist);
+  sky.position.copy(camera.position);
   if (targetDist === null) { slider.value = String(distToScale(dist)); updateScaleText(Number(slider.value)); }
 
   // Point size grows a touch when zoomed in; selection/labels adapt to scale.
@@ -628,10 +776,15 @@ function updateCamera(dt) {
 function updateLabelVisibility(dist = camera.position.length()) {
   const on = $('layer-labels').checked;
   issLabel.visible = on && dist < 30;
-  moonLabel.visible = on && dist > 25;
+  moonLabel.visible = on && dist > 25 && dist < 5000;
   earthLabel.visible = on && dist > 60;
-  l1Label.visible = on && dist > 80;
+  l1Label.visible = on && dist > 80 && dist < 5000;
   sunLabel.visible = on && dist > 80;
+  for (const p of PLANETS) {
+    if (p.label) p.label.visible = on && dist > 3000;
+    p.orbit.visible = dist > 3000; // closer in they only cut across the view as straight lines
+  }
+  earthMarker.visible = dist > 3000;
   auroraPoints.visible = $('layer-aurora').checked && dist < 12;
   mpLabel.visible = on && dist > 8 && dist < 120;
 }
@@ -640,7 +793,7 @@ function updateLabelVisibility(dist = camera.position.length()) {
 const auroraPoints = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({
   size: 0.03, vertexColors: true, transparent: true, opacity: 0.85, depthWrite: false, blending: THREE.AdditiveBlending, map: dotTex,
 }));
-scene.add(auroraPoints);
+earthGroup.add(auroraPoints);
 $('layer-aurora').addEventListener('change', () => updateLabelVisibility());
 
 // ----------------------------------------------------------- space weather
@@ -1012,7 +1165,7 @@ function frame(tNow) {
   lastFrame = tNow;
   const now = Date.now();
   const sim = simNow();
-  if (simClock.rate > 1 || now - lastBodies > 1000) { updateBodies(sim); lastBodies = now; }
+  updateBodies(sim);
   updateSatellites(sim);
   updateCamera(dt);
   updateWind(dt, now);
@@ -1033,7 +1186,7 @@ setInterval(() => {
   const t = new Date(simNow()).toISOString();
   clock.innerHTML = simClock.rate === 1
     ? `${t.slice(11, 19)} UTC`
-    : `${t.slice(5, 10)} ${t.slice(11, 19)} UTC<span class="rate">${simClock.rate}× sim</span>`; renderSelection(); renderFreshness(); renderWeather(); }, 500);
+    : `${t.slice(0, 10)} ${t.slice(11, 16)} UTC<span class="rate">${rateLabel(simClock.rate)}${simClock.rate > MAX_SAT_RATE ? ' · satellites paused' : ''}</span>`; renderSelection(); renderFreshness(); renderWeather(); }, 500);
 
 updateBodies(Date.now());
 setScaleValue(1);

@@ -27,6 +27,8 @@ const MIN = 60_000;
 const SOURCES = {
   // CelesTrak recommends CSV and no more than one fetch per 2 h update cycle.
   gp: { url: 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=csv', ttl: 120 * MIN, type: 'text/csv' },
+  // Debris clouds from four break-ups (2021 and 2007 ASAT tests, 2009 collision): several groups, one CSV.
+  debris: { urls: ['cosmos-1408-debris', 'fengyun-1c-debris', 'iridium-33-debris', 'cosmos-2251-debris'].map((g) => `https://celestrak.org/NORAD/elements/gp.php?GROUP=${g}&FORMAT=csv`), ttl: 120 * MIN, type: 'text/csv' },
   wind: { url: 'https://services.swpc.noaa.gov/json/rtsw/rtsw_wind_1m.json', ttl: 1 * MIN, type: 'application/json' },
   mag: { url: 'https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1m.json', ttl: 1 * MIN, type: 'application/json' },
   xray: { url: 'https://services.swpc.noaa.gov/json/goes/primary/xrays-6-hour.json', ttl: 1 * MIN, type: 'application/json' },
@@ -51,14 +53,20 @@ async function loadDiskCache() {
 async function refresh(key) {
   const src = SOURCES[key];
   if (DEMO) {
+    if (key === 'debris') throw new Error('debris: not available in demo mode');
     const body = Buffer.from(key === 'gp' ? synthCatalogCsv() : JSON.stringify(synthNoaa(key)));
     const entry = { body, fetchedAt: Date.now() };
     cache.set(key, entry);
     return entry;
   }
-  const res = await fetch(src.url, { headers: { 'User-Agent': 'orbit-globe/0.1 (local cache)' } });
-  if (!res.ok) throw new Error(`${key}: upstream HTTP ${res.status}`);
-  const body = Buffer.from(await res.arrayBuffer());
+  const parts = [];
+  for (const url of src.urls ?? [src.url]) { // sequential: be gentle with CelesTrak
+    const res = await fetch(url, { headers: { 'User-Agent': 'orbit-globe/0.1 (local cache)' } });
+    if (!res.ok) throw new Error(`${key}: upstream HTTP ${res.status}`);
+    const text = await res.text();
+    parts.push(parts.length ? text.slice(text.indexOf('\n') + 1) : text); // one CSV header
+  }
+  const body = Buffer.from(parts.join(''));
   if (body.length === 0) throw new Error(`${key}: empty response`);
   const entry = { body, fetchedAt: Date.now() };
   cache.set(key, entry);

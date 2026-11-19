@@ -14,16 +14,19 @@
 // When new orbital elements arrive, the next snapshot is flagged `corrected`
 // and the main thread eases each satellite onto its new track.
 //
-// Coordinates sent: Earth-fixed (ECF), in Earth radii, mapped to three.js axes
-// (x = ECF x, y = ECF z/north, z = -ECF y).
+// Coordinates sent: inertial (ECI, TEME), in Earth radii, mapped to three.js
+// axes (x = ECI x, y = ECI z/north, z = -ECI y). The globe rotates under them.
+//
+// At time-warp rates above MAX_RATE satellites are paused (they would be a blur
+// and propagation could not keep up); planets and the Moon carry on.
 
 import { json2satrec } from '/vendor/satellite.js/dist/io.js';
-import { propagate, gstime } from '/vendor/satellite.js/dist/propagation.js';
-import { eciToEcf } from '/vendor/satellite.js/dist/transforms.js';
+import { propagate } from '/vendor/satellite.js/dist/propagation.js';
 
 const RE = 6378.137;
 const MU = 398600.4418;
 const MAX_SIM_STEP_MS = 60000;
+const MAX_RATE = 3600;
 
 let sats = [];
 const indexById = new Map();
@@ -68,7 +71,7 @@ const GROUP_PATTERNS = [
   ['comms', /IRIDIUM|GLOBALSTAR|ORBCOMM|INTELSAT|\bSES\b|SES-|EUTELSAT|ASTRA|INMARSAT|VIASAT|ECHOSTAR|TELESAT|\bO3B|AMAZONAS|HISPASAT|ARABSAT|TURKSAT|CHINASAT|TIANLIAN|SIRIUS|\bXM-|\bTDRS|\bANIK|NILESAT|YAMAL|EXPRESS-|\bBADR|THURAYA|SKYNET|\bWGS\b|MUOS|DIRECTV|GALAXY|JCSAT|SUPERBIRD|APSTAR|ASIASAT|MEASAT|THAICOM|KOREASAT|OPTUS|NBN|YAHSAT|HYLAS|KA-SAT|SPACEWAY|TIANTONG|LUCH/],
 ];
 
-function classify(rec) {
+function classify(rec, source) {
   const n = Number(rec.MEAN_MOTION); // rev/day
   const e = Number(rec.ECCENTRICITY);
   const name = (rec.OBJECT_NAME || '').toUpperCase();
@@ -85,7 +88,8 @@ function classify(rec) {
   // keep one entry per station (Zarya, Tianhe) and drop the rest as duplicates.
   const dup = /^(ISS|CSS) \(/.test(name) && rec.NORAD_CAT_ID !== '25544' && rec.NORAD_CAT_ID !== '48274';
   let group = 'other';
-  if (rec.NORAD_CAT_ID === '25544' || rec.NORAD_CAT_ID === '48274') group = 'station';
+  if (source === 'debris') group = 'debris';
+  else if (rec.NORAD_CAT_ID === '25544' || rec.NORAD_CAT_ID === '48274') group = 'station';
   else {
     for (const [g, re] of GROUP_PATTERNS) if (re.test(name)) { group = g; break; }
     if (group === 'other' && regime === 'GEO') group = 'comms';
@@ -93,7 +97,7 @@ function classify(rec) {
   return { regime, group, periodMin, perigee, apogee, dup };
 }
 
-function loadElements(csvText) {
+function loadElements(csvText, source) {
   const records = parseCsv(csvText);
   const seen = new Set();
   let added = 0, updated = 0, failed = 0;
@@ -103,40 +107,39 @@ function loadElements(csvText) {
     try { satrec = json2satrec(rec); } catch { failed++; continue; }
     if (satrec.error) { failed++; continue; }
     const id = rec.NORAD_CAT_ID;
-    const meta = classify(rec);
+    const meta = classify(rec, source);
     if (meta.dup) continue;
     seen.add(id);
     const existing = indexById.get(id);
     if (existing !== undefined) {
-      Object.assign(sats[existing], { satrec, name: rec.OBJECT_NAME, epoch: rec.EPOCH, ...meta, dead: false });
+      Object.assign(sats[existing], { satrec, name: rec.OBJECT_NAME, epoch: rec.EPOCH, ...meta, source, dead: false });
       updated++;
     } else {
       indexById.set(id, sats.length);
-      sats.push({ id, satrec, name: rec.OBJECT_NAME, epoch: rec.EPOCH, ...meta, dead: false });
+      sats.push({ id, satrec, name: rec.OBJECT_NAME, epoch: rec.EPOCH, ...meta, source, dead: false });
       added++;
     }
   }
-  // Objects that dropped out of the catalog (decayed / reclassified) are hidden, indices kept stable.
-  for (const s of sats) if (!seen.has(s.id)) s.dead = true;
+  // Objects that dropped out of this source (decayed / reclassified) are hidden, indices kept stable.
+  for (const s of sats) if (s.source === source && !seen.has(s.id)) s.dead = true;
   return { added, updated, failed };
 }
 
 const tmp = new Float32Array(3);
-function positionAt(satrec, date, gmst) {
+function positionAt(satrec, date) {
   const pv = propagate(satrec, date);
   if (!pv || !pv.position || Number.isNaN(pv.position.x)) return null;
-  const ecf = eciToEcf(pv.position, gmst);
-  tmp[0] = ecf.x / RE; tmp[1] = ecf.z / RE; tmp[2] = -ecf.y / RE;
+  const e = pv.position;
+  tmp[0] = e.x / RE; tmp[1] = e.z / RE; tmp[2] = -e.y / RE;
   return tmp;
 }
 
 function snapshot(t) {
   const date = new Date(t);
-  const gmst = gstime(date);
   const pos = new Float32Array(sats.length * 3);
   for (let i = 0; i < sats.length; i++) {
     const s = sats[i];
-    const p = s.dead ? null : positionAt(s.satrec, date, gmst);
+    const p = s.dead ? null : positionAt(s.satrec, date);
     if (p) pos.set(p, i * 3);
     else { pos[i * 3] = NaN; pos[i * 3 + 1] = NaN; pos[i * 3 + 2] = NaN; }
   }
@@ -162,7 +165,8 @@ function sendCatalog() {
 
 function restart() {
   if (timer) clearInterval(timer);
-  if (!sats.length) { timer = null; return; }
+  timer = null;
+  if (!sats.length || clock.rate > MAX_RATE) return;
   const step = simStep();
   nextT = Math.floor(simNow() / step) * step;
   snapshot(nextT);
@@ -179,18 +183,15 @@ function restart() {
   }, Math.max(50, realStep / 2));
 }
 
-// Full orbit ring for a selected satellite: one period sampled in the inertial
-// frame, drawn at the Earth's orientation at time `t` so it reads as a closed loop.
+// Full orbit ring for a selected satellite: one period from time `t`, inertial frame.
 function track(id, t, samples = 240) {
   const i = indexById.get(id);
   if (i === undefined) return;
   const s = sats[i];
-  const start = new Date(t);
-  const gmst = gstime(start);
   const pts = new Float32Array(samples * 3);
   const periodMs = Math.min(s.periodMin, 1600) * 60000;
   for (let k = 0; k < samples; k++) {
-    const p = positionAt(s.satrec, new Date(t + (k / (samples - 1)) * periodMs), gmst);
+    const p = positionAt(s.satrec, new Date(t + (k / (samples - 1)) * periodMs));
     if (p) pts.set(p, k * 3);
   }
   postMessage({ type: 'track', id, pts }, [pts.buffer]);
@@ -200,7 +201,7 @@ onmessage = (e) => {
   const msg = e.data;
   if (msg.type === 'elements') {
     const hadSats = sats.length > 0;
-    const stats = loadElements(msg.csv);
+    const stats = loadElements(msg.csv, msg.source || 'active');
     sendCatalog();
     postMessage({ type: 'loaded', ...stats, total: sats.length });
     if (hadSats) pendingCorrection = true;

@@ -44,6 +44,7 @@ const files = {
   'style.css': read('public/style.css'),
   'main.js': main,
   'sat-worker.js': worker,
+  'stars.json': read('public/stars.json'),
 };
 fs.rmSync(out, { recursive: true, force: true });
 for (const [name, body] of Object.entries(files)) {

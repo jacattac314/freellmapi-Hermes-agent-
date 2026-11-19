@@ -120,9 +120,9 @@ body.demo #left, body.demo #right { top: 80px; }
 select { background: rgba(0, 0, 0, 0.35); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font: inherit; padding: 2px 4px; }
 .wind-legend { display: block; height: 6px; border-radius: 3px; margin: 4px 0 2px; background: linear-gradient(90deg, #5999ff, #ffffff, #ff8a3d, #ff3d1f); }
 
-.scale-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; }
+.scale-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 6px 8px; margin-bottom: 4px; }
 .scale-head #scale-title { margin: 0; }
-#time-rate { display: flex; gap: 2px; flex: none; }
+#time-rate { display: flex; flex-wrap: wrap; gap: 2px; flex: none; }
 #time-rate button { flex: none; padding: 2px 8px; font-size: 12px; }
 button.link { background: none; border: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; flex: none; }
 .small { font-size: 11px; }
