@@ -1,0 +1,18 @@
+{
+  "name": "@freellmapi/orbit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Real-time 3D satellite and space-weather globe",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "lightstreamer-client-web": "^9.2.3",
+    "satellite.js": "^7.2.0",
+    "three": "^0.187.0",
+    "topojson-client": "^3.1.0",
+    "world-atlas": "^2.0.2"
+  }
+}

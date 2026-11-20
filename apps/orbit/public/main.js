@@ -1,0 +1,1823 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { gstime } from '/vendor/satellite.js/dist/propagation.js';
+import { eciToGeodetic } from '/vendor/satellite.js/dist/transforms.js';
+
+// Units: 1 scene unit = 1 Earth radius. Frame: inertial, Earth-centred
+// (equatorial, J2000/TEME — the difference is invisible here), three.js Y-up:
+// x = ECI x, y = ECI z (north), z = -ECI y. The globe rotates by sidereal time,
+// so satellites, the Moon, the Sun and the planets all keep their true motion.
+const RE_KM = 6378.137;
+const CORR_MS = 5000; // how long an orbit-update correction takes to ease in
+const $ = (id) => document.getElementById(id);
+const toThree = (v) => new THREE.Vector3(v.x, v.z, -v.y);
+
+// Simulation clock. Live = real time. Time-warp runs it `rate`× faster from
+// wherever it is; Live jumps back to now. Satellites, Sun, Moon and day/night
+// follow it; measured data (solar wind, aurora) always stays on real time.
+let simClock = { anchorReal: Date.now(), anchorSim: Date.now(), rate: 1, epoch: 0 };
+const simNow = () => simClock.anchorSim + (Date.now() - simClock.anchorReal) * simClock.rate;
+
+// ------------------------------------------------------------------ scene
+const container = $('scene');
+const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+container.appendChild(renderer.domElement);
+
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(innerWidth, innerHeight);
+Object.assign(labelRenderer.domElement.style, { position: 'absolute', top: '0', pointerEvents: 'none' });
+container.appendChild(labelRenderer.domElement);
+
+const scene = new THREE.Scene();
+renderer.toneMapping = THREE.NoToneMapping;
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.001, 1e16);
+camera.position.set(2.2, 1.6, 2.6);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 1.15;
+controls.maxDistance = 5e14;
+controls.enablePan = false;
+
+// Soft glow on genuinely bright things (the Sun, sunlit satellites, glint,
+// aurora). On by default on larger screens; phones keep it off for battery.
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.6, 0.55, 0.8);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+let glowOn = innerWidth > 820;
+
+scene.add(new THREE.AmbientLight(0x334466, 0.35));
+const sunLight = new THREE.DirectionalLight(0xffffff, 2.2);
+scene.add(sunLight);
+
+const dotTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 32;
+  const g = c.getContext('2d'); g.fillStyle = '#fff'; g.beginPath(); g.arc(16, 16, 14, 0, Math.PI * 2); g.fill();
+  return new THREE.CanvasTexture(c);
+})();
+
+// Real star field: ~5,000 naked-eye stars (Hipparcos via d3-celestial), on a
+// sky sphere that travels with the camera so it stays at "infinity".
+const sky = new THREE.Group();
+scene.add(sky);
+const raDecToVec = (ra, dec, r) => {
+  const a = THREE.MathUtils.degToRad(ra), d = THREE.MathUtils.degToRad(dec);
+  return new THREE.Vector3(r * Math.cos(d) * Math.cos(a), r * Math.sin(d), -r * Math.cos(d) * Math.sin(a));
+};
+function bvColour(bv, out) { // B-V colour index → approximate star colour
+  const t = THREE.MathUtils.clamp((bv + 0.4) / 2.4, 0, 1);
+  return out.setRGB(0.62 + 0.38 * Math.min(1, t * 2), 0.72 + 0.28 * (1 - Math.abs(t - 0.35) * 1.4), 1 - 0.75 * Math.max(0, t - 0.25));
+}
+fetch('/stars.json').then((r) => r.json()).then(({ stars }) => {
+  // four magnitude bands so bright stars draw larger
+  const bands = [[-2, 1.5, 3.6], [1.5, 3, 2.6], [3, 4.5, 1.8], [4.5, 7, 1.2]];
+  const c = new THREE.Color();
+  for (const [lo, hi, size] of bands) {
+    const pos = [], col = [];
+    for (const [ra, dec, mag, bv] of stars) {
+      if (mag < lo || mag >= hi) continue;
+      const v = raDecToVec(ra, dec, 5e7);
+      pos.push(v.x, v.y, v.z);
+      bvColour(bv, c);
+      const k = THREE.MathUtils.clamp(1.25 - (mag - lo) * 0.25, 0.45, 1);
+      col.push(c.r * k, c.g * k, c.b * k);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    const pts = new THREE.Points(g, new THREE.PointsMaterial({ size, sizeAttenuation: false, vertexColors: true, map: dotTex, transparent: true, depthWrite: false }));
+    pts.frustumCulled = false;
+    sky.add(pts);
+  }
+}).catch((e) => console.warn('stars', e));
+
+// Earth. Everything fixed to the ground lives in earthGroup, rotated by
+// Greenwich sidereal time.
+const earthGroup = new THREE.Group();
+scene.add(earthGroup);
+const earth = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 96, 64),
+  new THREE.MeshPhongMaterial({ color: 0x0e2f55, emissive: 0x020812, shininess: 12, specular: 0x223344 }),
+);
+earthGroup.add(earth);
+
+// Shared world-space Sun direction for the custom shaders.
+const sunUniform = { value: new THREE.Vector3(1, 0, 0) };
+const LOGDEPTH_V = '#include <common>\n#include <logdepthbuf_pars_vertex>\n';
+const LOGDEPTH_F = '#include <common>\n#include <logdepthbuf_pars_fragment>\n';
+
+// NASA imagery: Blue Marble (day), Black Marble city lights (night), real clouds
+// from VIIRS (yesterday), lit by the true Sun. The day/night line, twilight band,
+// city lights and ocean glint all follow the real terminator at the viewed time.
+const texLoader = new THREE.TextureLoader();
+function loadTex(url) {
+  return new Promise((resolve, reject) => texLoader.load(url, (t) => {
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    resolve(t);
+  }, undefined, reject));
+}
+const earthShader = new THREE.ShaderMaterial({
+  uniforms: { dayTex: { value: null }, nightTex: { value: null }, cloudTex: { value: null }, sunDir: sunUniform },
+  vertexShader: LOGDEPTH_V + `
+    varying vec2 vUv; varying vec3 vN; varying vec3 vP;
+    void main() {
+      vUv = uv;
+      vN = normalize(mat3(modelMatrix) * normal);
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vP = wp.xyz;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+      #include <logdepthbuf_vertex>
+    }`,
+  fragmentShader: LOGDEPTH_F + `
+    uniform sampler2D dayTex, nightTex, cloudTex; uniform vec3 sunDir;
+    varying vec2 vUv; varying vec3 vN; varying vec3 vP;
+    void main() {
+      #include <logdepthbuf_fragment>
+      vec3 n = normalize(vN);
+      float mu = dot(n, sunDir);                         // cos(solar zenith angle)
+      float day = smoothstep(-0.10, 0.10, mu);          // ~±6°: civil twilight width
+      vec3 albedo = texture2D(dayTex, vUv).rgb;
+      float cloud = texture2D(cloudTex, vUv).r;
+      vec3 surf = mix(albedo, vec3(0.95), cloud);
+      vec3 col = surf * (0.03 + 1.1 * max(mu, 0.0));
+      // Sun glint on open ocean (Blue Marble oceans are dark and blue-dominant).
+      float ocean = smoothstep(0.02, 0.0, albedo.r - albedo.b * 0.55) * (1.0 - cloud);
+      vec3 v = normalize(cameraPosition - vP);
+      float spec = pow(max(dot(reflect(-sunDir, n), v), 0.0), 60.0) * ocean * day;
+      col += vec3(1.0, 0.92, 0.8) * spec * 0.9;
+      // Low sun is reddened by the long path through the air: tint, don't add.
+      float low = exp(-mu * mu * 260.0) * step(-0.02, mu);
+      col *= mix(vec3(1.0), vec3(1.35, 0.78, 0.5), low * 0.7);
+      // City lights on the night side, dimmed by cloud.
+      vec3 night = texture2D(nightTex, vUv).rgb;
+      float lights = max(0.0, max(night.r, night.g) - 0.16) * 2.2;
+      col += vec3(1.0, 0.78, 0.45) * lights * (1.0 - day) * (1.0 - cloud * 0.75);
+      gl_FragColor = vec4(col, 1.0);
+      #include <colorspace_fragment>
+    }`,
+});
+Promise.all(['tex/earth-day.jpg', 'tex/earth-night.jpg', 'tex/earth-clouds.jpg'].map(loadTex)).then(([d, n, c]) => {
+  earthShader.uniforms.dayTex.value = d;
+  earthShader.uniforms.nightTex.value = n;
+  earthShader.uniforms.cloudTex.value = c;
+  earth.material = earthShader;
+  document.body.classList.add('imagery');
+  coastMaterial.opacity = 0.18; // the imagery already shows the coasts
+  gratMaterial.opacity = 0.08;
+}).catch((e) => console.warn('earth imagery', e));
+
+// Atmosphere: a thin limb that is blue where sunlit, reddens along the
+// terminator and fades out on the night side (an approximation of Rayleigh
+// scattering; the layer is drawn ~1.5% of Earth's radius thick).
+scene.add(new THREE.Mesh(
+  new THREE.SphereGeometry(1.025, 96, 64),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+    uniforms: { sunDir: sunUniform },
+    vertexShader: LOGDEPTH_V + `varying vec3 vN; varying vec3 vP;
+      void main() { vN = normalize(mat3(modelMatrix) * normal); vec4 wp = modelMatrix * vec4(position, 1.0); vP = wp.xyz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+        #include <logdepthbuf_vertex>
+      }`,
+    fragmentShader: LOGDEPTH_F + `uniform vec3 sunDir; varying vec3 vN; varying vec3 vP;
+      void main() {
+        #include <logdepthbuf_fragment>
+        vec3 n = normalize(vN), v = normalize(cameraPosition - vP);
+        float rim = pow(1.0 - abs(dot(n, v)), 2.6);
+        float mu = dot(n, sunDir);
+        float lit = smoothstep(-0.35, 0.25, mu);
+        vec3 c = mix(vec3(1.0, 0.42, 0.12), vec3(0.32, 0.62, 1.0), smoothstep(-0.05, 0.45, mu));
+        gl_FragColor = vec4(c * rim * lit * 1.25, 1.0);
+        #include <colorspace_fragment>
+      }`,
+  }),
+));
+
+function lonLatToVec(lon, lat, r = 1) {
+  const la = THREE.MathUtils.degToRad(lat), lo = THREE.MathUtils.degToRad(lon);
+  // ECF: x = cos(lat)cos(lon), y = cos(lat)sin(lon), z = sin(lat) -> three (x, z, -y)
+  return new THREE.Vector3(r * Math.cos(la) * Math.cos(lo), r * Math.sin(la), -r * Math.cos(la) * Math.sin(lo));
+}
+
+const gratMaterial = new THREE.LineBasicMaterial({ color: 0x1d4a7a, transparent: true, opacity: 0.35 });
+const coastMaterial = new THREE.LineBasicMaterial({ color: 0x5fb3ea, transparent: true, opacity: 0.75 });
+// Graticule
+{
+  const pts = [];
+  for (let lat = -60; lat <= 60; lat += 30) for (let lon = 0; lon < 360; lon += 2) pts.push(lonLatToVec(lon, lat, 1.001), lonLatToVec(lon + 2, lat, 1.001));
+  for (let lon = 0; lon < 360; lon += 30) for (let lat = -88; lat < 88; lat += 2) pts.push(lonLatToVec(lon, lat, 1.001), lonLatToVec(lon, lat + 2, 1.001));
+  earthGroup.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
+    gratMaterial));
+}
+
+// Coastlines (Natural Earth 110m via world-atlas)
+fetch('/vendor/world-atlas/land-110m.json').then((r) => r.json()).then((topo) => {
+  const mesh = window.topojson.mesh(topo, topo.objects.land);
+  const pts = [];
+  for (const line of mesh.coordinates) {
+    for (let i = 0; i < line.length - 1; i++) pts.push(lonLatToVec(...line[i], 1.0015), lonLatToVec(...line[i + 1], 1.0015));
+  }
+  earthGroup.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
+    coastMaterial));
+}).catch((e) => console.warn('coastlines', e));
+
+// GEO ring
+const GEO_R = 42164 / RE_KM;
+const geoRing = new THREE.LineLoop(
+  new THREE.BufferGeometry().setFromPoints(Array.from({ length: 256 }, (_, i) => {
+    const a = (i / 256) * Math.PI * 2; return new THREE.Vector3(GEO_R * Math.cos(a), 0, GEO_R * Math.sin(a));
+  })),
+  new THREE.LineBasicMaterial({ color: 0xff8a65, transparent: true, opacity: 0.25 }),
+);
+scene.add(geoRing);
+
+function makeLabel(html) {
+  const div = document.createElement('div');
+  div.className = 'label3d';
+  div.innerHTML = html;
+  return new CSS2DObject(div);
+}
+
+// Moon
+const moon = new THREE.Mesh(new THREE.SphereGeometry(1737.4 / RE_KM, 64, 48), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, metalness: 0 }));
+loadTex('tex/moon.jpg').then((t) => { moon.material.map = t; moon.material.needsUpdate = true; }).catch(() => {});
+const moonLabel = makeLabel('Moon');
+moon.add(moonLabel);
+const moonMarker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+  new THREE.PointsMaterial({ color: 0xd0d0d0, size: 5, sizeAttenuation: false }));
+moonMarker.frustumCulled = false;
+moon.add(moonMarker);
+scene.add(moon);
+
+// Sun marker (direction only — the real Sun is ~23,500 Earth radii away)
+function glowTexture(inner, outer) {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d'); const grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  grd.addColorStop(0, inner); grd.addColorStop(0.25, inner); grd.addColorStop(1, outer);
+  g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+}
+// The Sun, at its true distance and size (radius 109 Earth radii), plus a glow.
+const solarGroup = new THREE.Group(); // heliocentric frame, positioned at the Sun
+scene.add(solarGroup);
+const sunBody = new THREE.Mesh(new THREE.SphereGeometry(696000 / RE_KM, 48, 32), new THREE.MeshBasicMaterial({ color: 0xfff1c9 }));
+solarGroup.add(sunBody);
+const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture('rgba(255,244,214,1)', 'rgba(255,200,80,0)'), depthWrite: false, blending: THREE.AdditiveBlending }));
+sunSprite.scale.setScalar(1400);
+solarGroup.add(sunSprite);
+const sunLabel = makeLabel('Sun');
+solarGroup.add(sunLabel);
+
+// L1 — where ACE / DSCOVR measure the solar wind before it reaches Earth
+const L1_R = 1.5e6 / RE_KM;
+const l1 = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture('rgba(255,213,79,1)', 'rgba(255,213,79,0)'), depthWrite: false }));
+l1.scale.setScalar(6);
+const l1Label = makeLabel('Sun–Earth L1');
+l1.add(l1Label);
+scene.add(l1);
+const sunLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(1, 0, 0)]),
+  new THREE.LineDashedMaterial({ color: 0xffd54f, dashSize: 4, gapSize: 4, transparent: true, opacity: 0.35 }));
+scene.add(sunLine);
+
+// Low-precision lunar position (≈0.3°, plenty for a visual), ECI km.
+function moonEci(date) {
+  const d = (date.getTime() / 86400000 + 2440587.5) - 2451545.0;
+  const rad = Math.PI / 180;
+  const L = (218.316 + 13.176396 * d) * rad, M = (134.963 + 13.064993 * d) * rad, F = (93.272 + 13.22935 * d) * rad;
+  const lon = L + 6.289 * rad * Math.sin(M), lat = 5.128 * rad * Math.sin(F), dist = 385001 - 20905 * Math.cos(M);
+  const eps = 23.439 * rad;
+  const x = dist * Math.cos(lat) * Math.cos(lon), y = dist * Math.cos(lat) * Math.sin(lon), z = dist * Math.sin(lat);
+  return { x, y: y * Math.cos(eps) - z * Math.sin(eps), z: y * Math.sin(eps) + z * Math.cos(eps) };
+}
+
+const sunDir = new THREE.Vector3(1, 0, 0);
+const earthLabel = makeLabel('Earth');
+earth.add(earthLabel);
+
+// --------------------------------------------------------------- planets
+// JPL "Keplerian Elements for Approximate Positions of the Major Planets"
+// (Standish; valid 1800–2050, errors of arcminutes): a [AU], e, I, L, ϖ, Ω [deg]
+// at J2000 and their rates per Julian century. "Earth" is the Earth–Moon barycentre.
+const AU_RE = 149597870.7 / RE_KM;
+const PLANETS = [
+  { name: 'Mercury', color: 0xb5a998, r: 2439.7, el: [0.38709927, 0.20563593, 7.00497902, 252.25032350, 77.45779628, 48.33076593], rt: [0.00000037, 0.00001906, -0.00594749, 149472.67411175, 0.16047689, -0.12534081] },
+  { name: 'Venus', color: 0xf2d39b, r: 6051.8, el: [0.72333566, 0.00677672, 3.39467605, 181.97909950, 131.60246718, 76.67984255], rt: [0.00000390, -0.00004107, -0.00078890, 58517.81538729, 0.00268329, -0.27769418] },
+  { name: 'Earth', color: 0x6cc4ff, r: 6371, el: [1.00000261, 0.01671123, -0.00001531, 100.46457166, 102.93768193, 0], rt: [0.00000562, -0.00004392, -0.01294668, 35999.37244981, 0.32327364, 0] },
+  { name: 'Mars', color: 0xe07a4f, r: 3389.5, el: [1.52371034, 0.09339410, 1.84969142, -4.55343205, -23.94362959, 49.55953891], rt: [0.00001847, 0.00007882, -0.00813131, 19140.30268499, 0.44441088, -0.29257343] },
+  { name: 'Jupiter', color: 0xd9b38c, r: 69911, el: [5.20288700, 0.04838624, 1.30439695, 34.39644051, 14.72847983, 100.47390909], rt: [-0.00011607, -0.00013253, -0.00183714, 3034.74612775, 0.21252668, 0.20469106] },
+  { name: 'Saturn', color: 0xe8d29a, r: 58232, el: [9.53667594, 0.05386179, 2.48599187, 49.95424423, 92.59887831, 113.66242448], rt: [-0.00125060, -0.00050991, 0.00193609, 1222.49362201, -0.41897216, -0.28867794] },
+  { name: 'Uranus', color: 0x9fe3e6, r: 25362, el: [19.18916464, 0.04725744, 0.77263783, 313.23810451, 170.95427630, 74.01692503], rt: [-0.00196176, -0.00004397, -0.00242939, 428.48202785, 0.40805281, 0.04240589] },
+  { name: 'Neptune', color: 0x6f8fff, r: 24622, el: [30.06992276, 0.00859048, 1.77004347, -55.12002969, 44.96476227, 131.78422574], rt: [0.00026291, 0.00005105, 0.00035372, 218.45945325, -0.32241464, -0.00508664] },
+];
+const D2R = Math.PI / 180, OBLIQ = 23.43928 * D2R;
+// Heliocentric position, ecliptic J2000, in AU. `meanAnomalyOffset` (deg) samples the orbit.
+function planetHelio(p, T, meanAnomalyOffset = 0) {
+  const [a, e, I, L, wbar, node] = p.el.map((v, i) => v + p.rt[i] * T);
+  const w = (wbar - node) * D2R, O = node * D2R, inc = I * D2R;
+  let M = ((L - wbar + meanAnomalyOffset) % 360 + 540) % 360 - 180;
+  M *= D2R;
+  let E = M + e * Math.sin(M);
+  for (let k = 0; k < 8; k++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+  const xp = a * (Math.cos(E) - e), yp = a * Math.sqrt(1 - e * e) * Math.sin(E);
+  const cw = Math.cos(w), sw = Math.sin(w), cO = Math.cos(O), sO = Math.sin(O), cI = Math.cos(inc), sI = Math.sin(inc);
+  return {
+    x: (cw * cO - sw * sO * cI) * xp + (-sw * cO - cw * sO * cI) * yp,
+    y: (cw * sO + sw * cO * cI) * xp + (-sw * sO + cw * cO * cI) * yp,
+    z: (sw * sI) * xp + (cw * sI) * yp,
+  };
+}
+// Ecliptic J2000 → ecliptic of date (precession in longitude, ~50"/yr, so the
+// planets line up with the satellites' frame of date) → equatorial → scene
+// axes, scaled from AU to Earth radii.
+let precessionRad = 0;
+function eclToScene(v, out = new THREE.Vector3()) {
+  const c = Math.cos(precessionRad), sn = Math.sin(precessionRad);
+  const x = v.x * c - v.y * sn, y = v.x * sn + v.y * c;
+  const ye = y * Math.cos(OBLIQ) - v.z * Math.sin(OBLIQ), ze = y * Math.sin(OBLIQ) + v.z * Math.cos(OBLIQ);
+  return out.set(x, ze, -ye).multiplyScalar(AU_RE);
+}
+const julianCenturies = (t) => (t / 86400000 + 2440587.5 - 2451545.0) / 36525;
+precessionRad = 1.396971 * julianCenturies(Date.now()) * D2R; // general precession, deg per century
+for (const p of PLANETS) {
+  // Orbit line, in the heliocentric group.
+  const T0 = julianCenturies(Date.now());
+  const pts = Array.from({ length: 361 }, (_, k) => eclToScene(planetHelio(p, T0, k)));
+  p.orbit = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: p.color, transparent: true, opacity: p.name === 'Earth' ? 0.45 : 0.3 }));
+  p.orbit.frustumCulled = false;
+  solarGroup.add(p.orbit);
+  if (p.name === 'Earth') continue; // Earth itself is the globe at the origin
+  p.obj = new THREE.Group();
+  p.obj.add(new THREE.Mesh(new THREE.SphereGeometry(p.r / RE_KM, 32, 24), new THREE.MeshPhongMaterial({ color: p.color })));
+  const marker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+    new THREE.PointsMaterial({ color: p.color, size: 7, sizeAttenuation: false, map: dotTex, alphaTest: 0.5, transparent: true }));
+  marker.frustumCulled = false;
+  p.obj.add(marker);
+  p.label = makeLabel(p.name);
+  p.obj.add(p.label);
+  solarGroup.add(p.obj);
+}
+// Earth's own marker for solar-system scales (the globe is far too small to see).
+const earthMarker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+  new THREE.PointsMaterial({ color: 0x6cc4ff, size: 7, sizeAttenuation: false, map: dotTex, alphaTest: 0.5, transparent: true }));
+earthMarker.frustumCulled = false;
+scene.add(earthMarker);
+
+let currentGmst = 0;
+const sunScene = new THREE.Vector3(); // the Sun's position relative to Earth, scene units
+const tmpV = new THREE.Vector3();
+function updateBodies(now) {
+  const date = new Date(now);
+  currentGmst = gstime(date);
+  earthGroup.rotation.y = currentGmst;
+  const T = julianCenturies(now);
+  precessionRad = 1.396971 * T * D2R;
+  const earthHelio = eclToScene(planetHelio(PLANETS[2], T), tmpV);
+  sunScene.copy(earthHelio).negate();
+  solarGroup.position.copy(sunScene);
+  sunDir.copy(sunScene).normalize();
+  sunUniform.value.copy(sunDir);
+  for (const p of PLANETS) if (p.obj) eclToScene(planetHelio(p, T), p.obj.position);
+  sunLight.position.copy(sunDir).multiplyScalar(50);
+  l1.position.copy(sunDir).multiplyScalar(L1_R);
+  sunLine.geometry.setFromPoints([sunDir.clone().multiplyScalar(1.05), sunDir.clone().multiplyScalar(L1_R)]);
+  sunLine.computeLineDistances();
+  moon.position.copy(toThree(moonEci(date))).divideScalar(RE_KM);
+}
+
+// ------------------------------------------------------------- satellites
+const REGIME_COLOR = { LEO: 0x4fc3f7, MEO: 0xffd54f, GEO: 0xff8a65, HEO: 0xce93d8 };
+
+
+let catalog = null; // { ids, names, regimes, groups, periods, epochs, dead }
+let N = 0;
+let satGeom = null, satPoints = null, posAttr = null;
+let visible = new Uint8Array(0);
+// Satellites shine only when sunlit: a satellite behind Earth (relative to the
+// Sun) and within one Earth radius of the Sun–Earth axis is in shadow.
+const satMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, vertexColors: true,
+  uniforms: { size: { value: 3 }, opacity: { value: 1 }, pixelRatio: { value: renderer.getPixelRatio() }, sunDir: sunUniform },
+  vertexShader: LOGDEPTH_V + `
+    uniform float size, pixelRatio; uniform vec3 sunDir; varying vec3 vCol; varying float vLit;
+    void main() {
+      vCol = color;
+      float along = dot(position, sunDir);
+      float perp = length(position - along * sunDir);
+      vLit = (along < 0.0 && perp < 1.0) ? 0.0 : 1.0;
+      gl_PointSize = size * pixelRatio * (vLit > 0.5 ? 1.0 : 0.85);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      #include <logdepthbuf_vertex>
+    }`,
+  fragmentShader: LOGDEPTH_F + `
+    uniform float opacity; varying vec3 vCol; varying float vLit;
+    void main() {
+      #include <logdepthbuf_fragment>
+      vec2 d = gl_PointCoord - 0.5; float r = length(d);
+      if (r > 0.5) discard;
+      vec3 c = mix(vCol * 0.22, vCol * 1.15, vLit);   // in shadow: a faint ember, not gone
+      gl_FragColor = vec4(c, opacity * smoothstep(0.5, 0.35, r));
+      #include <colorspace_fragment>
+    }`,
+});
+
+const selMarker = new THREE.Points(
+  new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(3), 3)),
+  new THREE.PointsMaterial({ size: 14, sizeAttenuation: false, color: 0xffffff, map: glowTexture('rgba(255,255,255,0)', 'rgba(255,255,255,0)'), transparent: true }),
+);
+// ring texture for selection
+selMarker.material.map = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d'); g.strokeStyle = '#fff'; g.lineWidth = 6; g.beginPath(); g.arc(32, 32, 26, 0, Math.PI * 2); g.stroke();
+  return new THREE.CanvasTexture(c);
+})();
+selMarker.visible = false;
+selMarker.frustumCulled = false;
+scene.add(selMarker);
+
+const issMarker = new THREE.Points(
+  new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(3), 3)),
+  new THREE.PointsMaterial({ size: 9, sizeAttenuation: false, color: 0xffffff, map: dotTex, alphaTest: 0.5, transparent: true }),
+);
+issMarker.frustumCulled = false;
+issMarker.visible = false;
+const issLabel = makeLabel('ISS');
+issMarker.add(issLabel);
+scene.add(issMarker);
+let issIndex = -1;
+
+
+function buildSatGeometry() {
+  if (satPoints) { scene.remove(satPoints); satGeom.dispose(); }
+  satGeom = new THREE.BufferGeometry();
+  posAttr = new THREE.BufferAttribute(new Float32Array(N * 3), 3);
+  posAttr.setUsage(THREE.DynamicDrawUsage);
+  satGeom.setAttribute('position', posAttr);
+  const col = new Float32Array(N * 3);
+  const c = new THREE.Color();
+  for (let i = 0; i < N; i++) {
+    c.setHex(catalog.groups[i] === 'station' ? 0xffffff : catalog.groups[i] === 'debris' ? 0xb07a7a : REGIME_COLOR[catalog.regimes[i]] ?? 0xaaaaaa);
+    col.set([c.r, c.g, c.b], i * 3);
+  }
+  satGeom.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  satGeom.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e5);
+  satPoints = new THREE.Points(satGeom, satMat);
+  satPoints.frustumCulled = false;
+  scene.add(satPoints);
+  issIndex = catalog.ids.indexOf('25544');
+  issMarker.visible = issIndex >= 0;
+  applyFilters();
+}
+
+// --- snapshot buffer + correction easing
+/** @type {{t:number,pos:Float32Array,corr:null|{C:Float32Array,tS:number}}[]} */
+const snaps = [];
+let activeCorr = null;
+
+// 1 → 0 over CORR_MS with a smoothstep, so the satellite accelerates onto the
+// corrected track and settles gently instead of lurching.
+function corrWeight(snap) {
+  if (!snap.corr) return 0;
+  const u = (snap.t - snap.corr.tS) / CORR_MS;
+  return u <= 0 ? 1 : u >= 1 ? 0 : 1 - u * u * (3 - 2 * u);
+}
+// Adjusted (eased) value of component k in a snapshot.
+function adj(snap, k, w) {
+  const v = k < snap.pos.length ? snap.pos[k] : NaN;
+  return snap.corr && k < snap.corr.C.length ? v - snap.corr.C[k] * w : v;
+}
+
+function onSnapshot(msg) {
+  if (msg.epoch !== simClock.epoch) return; // computed for a clock setting we've since changed
+  const snap = { t: msg.t, pos: msg.pos, corr: null };
+  if (msg.corrected && snaps.length >= 2) {
+    // New orbital elements: measure how far each satellite would "jump", then
+    // ease that jump out over a few seconds instead of teleporting.
+    const p1 = snaps[snaps.length - 1], p2 = snaps[snaps.length - 2];
+    const w1 = corrWeight(p1), w2 = corrWeight(p2);
+    const C = new Float32Array(snap.pos.length);
+    for (let k = 0; k < C.length; k++) {
+      const a = adj(p1, k, w1), b = adj(p2, k, w2);
+      const predicted = a + (a - b) * ((snap.t - p1.t) / (p1.t - p2.t));
+      const d = snap.pos[k] - predicted;
+      C[k] = Number.isFinite(d) && Math.abs(d) < 0.5 ? d : 0; // >3000 km: just snap
+    }
+    activeCorr = { C, tS: snap.t };
+    correctionsApplied++;
+  }
+  if (activeCorr && snap.t - activeCorr.tS < CORR_MS) snap.corr = activeCorr;
+  else activeCorr = null;
+  snaps.push(snap);
+  snaps.sort((a, b) => a.t - b.t);
+  while (snaps.length > 6) snaps.shift();
+}
+let correctionsApplied = 0;
+
+const satPos = (i, out) => out.set(posAttr.array[i * 3], posAttr.array[i * 3 + 1], posAttr.array[i * 3 + 2]);
+
+function updateSatellites(now) {
+  if (!posAttr || snaps.length === 0 || !satsAllowed() || satsAlpha <= 0.02) return;
+  let A, B;
+  for (let i = 0; i < snaps.length - 1; i++) if (snaps[i].t <= now && now < snaps[i + 1].t) { A = snaps[i]; B = snaps[i + 1]; }
+  if (!A) { // worker behind (throttled tab) or not started: extrapolate from the newest pair
+    B = snaps[snaps.length - 1]; A = snaps.length > 1 ? snaps[snaps.length - 2] : B;
+  }
+  const span = B.t - A.t;
+  const alpha = span > 0 ? Math.min((now - A.t) / span, 3) : 0;
+  const wA = corrWeight(A), wB = corrWeight(B);
+  const arr = posAttr.array;
+  for (let i = 0; i < N; i++) {
+    const k = i * 3;
+    if (!visible[i]) { arr[k] = arr[k + 1] = arr[k + 2] = 0; continue; } // parked inside Earth = hidden
+    for (let j = 0; j < 3; j++) {
+      const a = adj(A, k + j, wA), b = adj(B, k + j, wB);
+      arr[k + j] = a + (b - a) * alpha;
+    }
+    if (!Number.isFinite(arr[k]) || !Number.isFinite(arr[k + 1]) || !Number.isFinite(arr[k + 2])) arr[k] = arr[k + 1] = arr[k + 2] = 0;
+  }
+  posAttr.needsUpdate = true;
+  if (issIndex >= 0) {
+    // Move the object itself (its vertex stays at 0,0,0) so the attached label follows.
+    issMarker.position.set(arr[issIndex * 3], arr[issIndex * 3 + 1], arr[issIndex * 3 + 2]);
+    issMarker.visible = visible[issIndex] === 1;
+  }
+  if (selected >= 0) {
+    const p = selMarker.geometry.attributes.position;
+    p.array.set(arr.subarray(selected * 3, selected * 3 + 3)); p.needsUpdate = true;
+    selMarker.visible = visible[selected] === 1;
+    // velocity for the info card (Earth-fixed + Earth rotation = inertial)
+    const k = selected * 3;
+    const pa = new THREE.Vector3(adj(A, k, wA), adj(A, k + 1, wA), adj(A, k + 2, wA));
+    const pb = new THREE.Vector3(adj(B, k, wB), adj(B, k + 1, wB), adj(B, k + 2, wB));
+    selVel.copy(pb).sub(pa).multiplyScalar(RE_KM / (span / 1000 || 1));
+  }
+}
+
+// --- worker wiring
+const worker = new Worker('/sat-worker.js', { type: 'module' });
+window.__orbit = { worker, get positions() { return posAttr?.array; }, get sim() { return simRender; } }; // debug hook (used by the smoothness test)
+const freshness = { gp: null, gpError: null, satsLoaded: 0 };
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'catalog') {
+    const grew = !catalog || m.ids.length !== N;
+    catalog = m; N = m.ids.length;
+    buildTypeList();
+    if (grew) buildSatGeometry(); else applyFilters();
+    requestTracks();
+  } else if (m.type === 'snapshot') onSnapshot(m);
+  else if (m.type === 'loaded') freshness.satsLoaded = m.total;
+  else if (m.type === 'track') onTrack(m);
+};
+
+let lastGpFetchedAt = 0;
+let lastDebrisFetchedAt = 0;
+async function pollDebris() {
+  // Optional: debris clouds from four break-ups (ASAT tests, collision). Absent → skipped.
+  try {
+    const res = await fetch('/api/data/debris');
+    if (!res.ok) return;
+    const fetchedAt = Number(res.headers.get('X-Fetched-At'));
+    if (fetchedAt === lastDebrisFetchedAt) return;
+    lastDebrisFetchedAt = fetchedAt;
+    worker.postMessage({ type: 'elements', csv: await res.text(), source: 'debris' });
+  } catch { /* optional layer */ }
+}
+async function pollCatalog() {
+  try {
+    const res = await fetch('/api/data/gp');
+    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+    noteDemo(res);
+    const fetchedAt = Number(res.headers.get('X-Fetched-At'));
+    freshness.gpError = res.headers.get('X-Upstream-Error') || null;
+    if (fetchedAt !== lastGpFetchedAt) {
+      lastGpFetchedAt = fetchedAt;
+      freshness.gp = fetchedAt;
+      worker.postMessage({ type: 'elements', csv: await res.text(), source: 'active' });
+    }
+    pollDebris();
+  } catch (err) {
+    freshness.gpError = String(err.message || err);
+  }
+}
+
+// ---------------------------------------------------------------- filters
+const regimeOn = { LEO: true, MEO: true, GEO: true, HEO: true };
+const GROUPS = [
+  ['station', 'Crewed stations'], ['starlink', 'Starlink'], ['oneweb', 'OneWeb'], ['kuiper', 'Amazon Kuiper'],
+  ['gnss', 'Navigation (GPS, Galileo…)'], ['weather', 'Weather'], ['imaging', 'Earth imaging'],
+  ['science', 'Science & telescopes'], ['comms', 'Communications'], ['other', 'Everything else'],
+  ['debris', 'Debris clouds'],
+];
+const groupOn = Object.fromEntries(GROUPS.map(([g]) => [g, true]));
+document.querySelectorAll('[data-regime]').forEach((el) => el.addEventListener('change', () => { regimeOn[el.dataset.regime] = el.checked; applyFilters(); }));
+
+function buildTypeList() {
+  const counts = {};
+  for (let i = 0; i < N; i++) if (!catalog.dead[i]) counts[catalog.groups[i]] = (counts[catalog.groups[i]] || 0) + 1;
+  $('type-list').innerHTML = GROUPS.filter(([g]) => counts[g]).map(([g, label]) =>
+    `<label><input type="checkbox" data-group="${g}" ${groupOn[g] ? 'checked' : ''} /> ${label}<span class="n">${counts[g].toLocaleString()}</span></label>`).join('');
+  $('type-list').querySelectorAll('[data-group]').forEach((el) => el.addEventListener('change', () => { groupOn[el.dataset.group] = el.checked; applyFilters(); }));
+}
+function setAllTypes(on) {
+  for (const [g] of GROUPS) groupOn[g] = on;
+  $('type-list').querySelectorAll('[data-group]').forEach((el) => { el.checked = on; });
+  applyFilters();
+}
+$('types-all').onclick = () => setAllTypes(true);
+$('types-none').onclick = () => setAllTypes(false);
+
+// Altitude band on a stepped scale that gives LEO room without losing GEO.
+const ALT_STOPS = [0, 300, 450, 600, 800, 1200, 2000, 5000, 15000, 25000, 34000, 38000, Infinity];
+const fmtAlt = (km) => (km === Infinity ? 'any' : km >= 1000 ? `${(km / 1000).toLocaleString()}k` : String(km));
+function altBand() {
+  let lo = Number($('alt-min').value), hi = Number($('alt-max').value);
+  if (lo > hi) [lo, hi] = [hi, lo];
+  return [ALT_STOPS[lo], ALT_STOPS[hi]];
+}
+for (const id of ['alt-min', 'alt-max']) $(id).addEventListener('input', applyFilters);
+$('only-matches').addEventListener('change', applyFilters);
+
+function applyFilters() {
+  const [lo, hi] = altBand();
+  $('alt-label').textContent = lo === 0 && hi === Infinity ? 'All altitudes' : `${fmtAlt(lo)} – ${fmtAlt(hi)} km`;
+  if (!catalog) return;
+  const q = $('only-matches').checked ? $('search').value.trim().toUpperCase() : '';
+  visible = new Uint8Array(N);
+  let count = 0;
+  for (let i = 0; i < N; i++) {
+    const on = !catalog.dead[i] && regimeOn[catalog.regimes[i]] && groupOn[catalog.groups[i]]
+      && catalog.apogees[i] >= lo && catalog.perigees[i] <= hi
+      && (!q || catalog.names[i].toUpperCase().includes(q) || catalog.ids[i] === q);
+    visible[i] = on ? 1 : 0; count += visible[i];
+  }
+  const text = `Showing ${count.toLocaleString()} of ${N.toLocaleString()}`;
+  $('sat-count').textContent = text;
+  $('filter-count').textContent = text;
+}
+
+// Phone layout: panels are sheets toggled from the top bar.
+function showPanel(side) {
+  const other = side === 'left' ? 'right' : 'left';
+  document.body.classList.remove(`show-${other}`);
+  $(`toggle-${other}`).classList.remove('active');
+  const on = document.body.classList.toggle(`show-${side}`);
+  $(`toggle-${side}`).classList.toggle('active', on);
+}
+$('toggle-left').onclick = () => showPanel('left');
+$('toggle-right').onclick = () => showPanel('right');
+
+$('layer-glow').checked = glowOn;
+$('layer-glow').addEventListener('change', (e) => { glowOn = e.target.checked; });
+$('layer-rings').addEventListener('change', (e) => { geoRing.visible = e.target.checked; });
+$('layer-labels').addEventListener('change', () => updateLabelVisibility());
+
+// ------------------------------------------------------------- selection
+let selected = -1;
+let following = false;
+const selVel = new THREE.Vector3();
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+
+function pick(clientX, clientY) {
+  if (!satPoints) return -1;
+  pointer.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(pointer, camera);
+  // Threshold in world units ≈ 6 px at the satellite's distance
+  raycaster.params.Points.threshold = camera.position.distanceTo(controls.target) * 0.008;
+  const hits = raycaster.intersectObject(satPoints);
+  const earthHit = raycaster.intersectObject(earth)[0];
+  for (const h of hits) {
+    if (!visible[h.index]) continue;
+    if (earthHit && earthHit.distance < h.distance) continue; // behind the Earth
+    return h.index;
+  }
+  return -1;
+}
+
+function select(i) {
+  selected = i;
+  following = false;
+  $('sel-follow').classList.remove('active');
+  if (i < 0) { $('selection').hidden = true; selMarker.visible = false; requestTracks(); return; }
+  $('selection').hidden = false;
+  $('sel-name').textContent = catalog.names[i];
+  if (innerWidth <= 820 && !document.body.classList.contains('show-right')) showPanel('right');
+  requestTracks();
+}
+$('sel-clear').onclick = () => select(-1);
+$('sel-follow').onclick = () => { following = !following; $('sel-follow').classList.toggle('active', following); };
+
+// ------------------------------------------------------------------- time
+// The clock has a *target* (where time is heading) and a *rendered* time that
+// glides toward it, so scrubbing and "Now" sweep smoothly instead of jumping.
+// While it glides a long way, satellites fade out and back in, because SGP4
+// can't propagate 17,000 objects every frame.
+const MAX_SAT_RATE = 3600;                 // above this the worker pauses satellites
+const SAT_WINDOW_MS = 30 * 86400000;       // orbit elements are only meaningful near today
+const RATES = [-2592000, -86400, -3600, -300, -60, -10, -1, 1, 10, 60, 300, 3600, 86400, 2592000];
+let simRender = Date.now();
+let gliding = false;
+let lastNonZeroRate = 1;
+let satsAlpha = 1;
+
+function satsAllowed() {
+  return Math.abs(simClock.rate) <= MAX_SAT_RATE && Math.abs(simNow() - Date.now()) < SAT_WINDOW_MS;
+}
+function setClock(sim, rate, { glide = true } = {}) {
+  simClock = { anchorReal: Date.now(), anchorSim: sim, rate, epoch: simClock.epoch + 1, hidden: false };
+  simClock.hidden = !satsAllowed();
+  if (rate !== 0) lastNonZeroRate = rate;
+  gliding = glide && Math.abs(simRender - sim) > 2000;
+  if (!gliding) simRender = sim;
+  snaps.length = 0; // positions now come from the new timeline
+  activeCorr = null;
+  worker.postMessage({ type: 'clock', clock: simClock });
+  requestTracks();
+  renderTimeUi();
+}
+function rateLabel(r) {
+  if (r === 0) return 'Paused';
+  const a = Math.abs(r), sign = r < 0 ? '−' : '';
+  if (r === 1) return 'Live speed';
+  return sign + (a >= 86400 ? `${a / 86400} d/s` : a >= 3600 ? `${a / 3600} h/s` : `${a}×`);
+}
+function stepRate(dir) {
+  const cur = simClock.rate === 0 ? lastNonZeroRate : simClock.rate;
+  let i = RATES.indexOf(cur);
+  if (i < 0) i = RATES.indexOf(1);
+  i = Math.max(0, Math.min(RATES.length - 1, i + dir));
+  setClock(simNow(), RATES[i], { glide: false });
+}
+$('t-rev').onclick = () => stepRate(-1);
+$('t-fwd').onclick = () => stepRate(1);
+$('t-play').onclick = () => setClock(simNow(), simClock.rate === 0 ? lastNonZeroRate : 0, { glide: false });
+$('t-now').onclick = () => setClock(Date.now(), 1); // glides back to the present
+
+// Timeline: ±1 year, cubic so the region near "now" gets fine control.
+const SCRUB_MAX_DAYS = 365;
+const scrubToOffset = (v) => Math.sign(v) * Math.pow(Math.abs(v) / 1000, 3) * SCRUB_MAX_DAYS * 86400000;
+const offsetToScrub = (ms) => Math.sign(ms) * Math.cbrt(Math.min(Math.abs(ms) / (SCRUB_MAX_DAYS * 86400000), 1)) * 1000;
+const scrub = $('t-scrub');
+let scrubbing = false, rateBeforeScrub = 1;
+scrub.addEventListener('pointerdown', () => { scrubbing = true; rateBeforeScrub = simClock.rate; });
+scrub.addEventListener('input', () => {
+  if (!scrubbing) { scrubbing = true; rateBeforeScrub = simClock.rate; }
+  setClock(Date.now() + scrubToOffset(Number(scrub.value)), 0);
+});
+const endScrub = () => {
+  if (!scrubbing) return;
+  scrubbing = false;
+  setClock(simNow(), rateBeforeScrub === 0 ? 0 : rateBeforeScrub);
+};
+scrub.addEventListener('change', endScrub);
+scrub.addEventListener('pointerup', endScrub);
+
+function fmtOffset(ms) {
+  const a = Math.abs(ms), sign = ms < 0 ? '−' : '+';
+  if (a < 60000) return 'now';
+  if (a < 3600000) return `${sign}${Math.round(a / 60000)} min`;
+  if (a < 2 * 86400000) return `${sign}${(a / 3600000).toFixed(1)} h`;
+  return `${sign}${Math.round(a / 86400000)} d`;
+}
+function renderTimeUi() {
+  const live = simClock.rate === 1 && Math.abs(simNow() - Date.now()) < 5000;
+  $('t-rate').textContent = live ? 'Live' : rateLabel(simClock.rate);
+  $('t-now').classList.toggle('active', live);
+  $('t-play').textContent = simClock.rate === 0 ? '▶' : '❚❚';
+  $('t-play').title = simClock.rate === 0 ? 'Play' : 'Pause';
+  if (!scrubbing) scrub.value = String(Math.round(offsetToScrub(simNow() - Date.now())));
+  const t = new Date(simRender).toISOString();
+  const off = simNow() - Date.now();
+  const note = !satsAllowed() ? (Math.abs(simClock.rate) > MAX_SAT_RATE ? ' · satellites paused (too fast)' : ' · satellites hidden (orbit data is for today)') : '';
+  clock.innerHTML = live
+    ? `${t.slice(11, 19)} UTC`
+    : `${t.slice(0, 10)} ${t.slice(11, 16)} UTC<span class="rate">${fmtOffset(off)} · ${rateLabel(simClock.rate)}${note}</span>`;
+}
+
+function updateSimTime(dt) {
+  const target = simNow();
+  if (gliding) {
+    const diff = target - simRender;
+    simRender += diff * (1 - Math.exp(-dt * 2.8)); // ~2 s glide
+    if (Math.abs(target - simRender) < Math.max(1000, Math.abs(simClock.rate) * 50)) { gliding = false; simRender = target; }
+  } else simRender = target;
+  // Satellites fade out while gliding or when out of range, and back in when settled.
+  const want = satsAllowed() && !gliding ? 1 : 0;
+  satsAlpha += (want - satsAlpha) * (1 - Math.exp(-dt * 6));
+  satMat.uniforms.opacity.value = satsAlpha;
+  const show = satsAlpha > 0.02;
+  if (satPoints) satPoints.visible = show;
+  for (const line of tracks.values()) line.visible = show && $('layer-orbits').checked && line.userData.ok;
+  if (!show) { issMarker.visible = false; selMarker.visible = false; }
+  return simRender;
+}
+
+// ------------------------------------------------------------ orbit paths
+// One closed orbit for the stations and whatever is selected (from the worker,
+// inertial frame), the Moon's orbit, plus probe trajectories further down.
+const tracks = new Map(); // NORAD id → THREE.Line
+const STATION_IDS = ['25544', '48274'];
+function trackIds() { return [...new Set([...STATION_IDS, ...(selected >= 0 ? [catalog.ids[selected]] : [])])]; }
+function requestTracks() {
+  if (!catalog || !satsAllowed()) return;
+  for (const id of trackIds()) worker.postMessage({ type: 'track', id, t: simNow() });
+  for (const [id, line] of tracks) if (!trackIds().includes(id)) { scene.remove(line); line.geometry.dispose(); tracks.delete(id); }
+}
+function onTrack(m) {
+  let line = tracks.get(m.id);
+  if (!line) {
+    const isSel = selected >= 0 && catalog.ids[selected] === m.id;
+    line = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: isSel ? 0.6 : 0.3 }));
+    line.frustumCulled = false;
+    scene.add(line);
+    tracks.set(m.id, line);
+  }
+  line.geometry.dispose();
+  line.geometry = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(m.pts, 3));
+  line.material.opacity = selected >= 0 && catalog.ids[selected] === m.id ? 0.6 : 0.3;
+  line.userData.ok = true;
+}
+setInterval(requestTracks, 15000);
+
+const moonOrbit = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xbfbfbf, transparent: true, opacity: 0.35 }));
+moonOrbit.frustumCulled = false;
+scene.add(moonOrbit);
+let moonOrbitAt = -Infinity;
+function updateMoonOrbit(t) {
+  if (Math.abs(t - moonOrbitAt) < 6 * 3600000) return;
+  moonOrbitAt = t;
+  const pts = [];
+  for (let k = -168; k <= 168; k++) pts.push(toThree(moonEci(new Date(t + k * 2 * 3600000))).divideScalar(RE_KM)); // ±14 days
+  moonOrbit.geometry.dispose();
+  moonOrbit.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+}
+
+// ----------------------------------------------------------------- probes
+// Real trajectories from NASA/JPL Horizons (public/probes.json, fetched by
+// fetch-probes.mjs): geocentric ICRF positions sampled at a fixed step.
+function j2000ToScene(x, y, z, out) {
+  // ICRF equatorial → ecliptic, precess to date, back to equatorial (scene axes, Earth radii).
+  const ce = Math.cos(OBLIQ), se = Math.sin(OBLIQ), cp = Math.cos(precessionRad), sp = Math.sin(precessionRad);
+  const ey = y * ce + z * se, ez = -y * se + z * ce;
+  const px = x * cp - ey * sp, py = x * sp + ey * cp;
+  const qy = py * ce - ez * se, qz = py * se + ez * ce;
+  return out.set(px, qz, -qy).divideScalar(RE_KM);
+}
+const probes = [];
+fetch('/probes.json').then((r) => r.json()).then((data) => {
+  for (const p of data.probes) {
+    const n = p.xyz.length / 3;
+    const kmAt = (i) => [p.xyz[i * 3] * 1000, p.xyz[i * 3 + 1] * 1000, p.xyz[i * 3 + 2] * 1000];
+    const maxAu = Math.max(...Array.from({ length: n }, (_, i) => Math.hypot(...kmAt(i)))) / 1.496e8;
+    const nearEarth = maxAu < 0.05; // L1/L2 craft: draw their loops around Earth
+    const pts = [];
+    const v = new THREE.Vector3();
+    for (let i = 0; i < n; i++) {
+      j2000ToScene(...kmAt(i), v);
+      if (!nearEarth) { // heliocentric drawing: add Earth's own position at that moment
+        const T = julianCenturies(p.t0 + i * p.dt);
+        v.add(eclToScene(planetHelio(PLANETS[2], T)));
+      }
+      pts.push(v.clone());
+    }
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: 0xffb74d, transparent: true, opacity: 0.4 }));
+    line.frustumCulled = false;
+    (nearEarth ? scene : solarGroup).add(line);
+    const marker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+      new THREE.PointsMaterial({ color: 0xffcc80, size: 6, sizeAttenuation: false, map: dotTex, alphaTest: 0.5, transparent: true }));
+    marker.frustumCulled = false;
+    const label = makeLabel(p.name);
+    label.element.title = p.note;
+    marker.add(label);
+    scene.add(marker);
+    probes.push({ ...p, n, kmAt, nearEarth, line, marker, label, distKm: 0 });
+  }
+  $('probe-count').textContent = `${probes.length} probes · JPL Horizons, ${data.generated.slice(0, 10)}`;
+}).catch((e) => console.warn('probes', e));
+
+const pv = new THREE.Vector3();
+function updateProbes(t, camDist) {
+  const on = $('layer-probes').checked, labelsOn = $('layer-labels').checked;
+  for (const p of probes) {
+    const f = (t - p.t0) / p.dt;
+    const inRange = f >= 0 && f <= p.n - 1;
+    // Sun-orbiting probes' paths only make sense at planet scale; L1/L2 loops from the Moon out.
+    p.line.visible = on && $('layer-orbits').checked && camDist > (p.nearEarth ? 60 : 3000);
+    p.marker.visible = on && inRange;
+    if (!inRange) continue;
+    const i = Math.min(Math.floor(f), p.n - 2), u = f - i;
+    const a = p.kmAt(i), b = p.kmAt(i + 1);
+    const x = a[0] + (b[0] - a[0]) * u, y = a[1] + (b[1] - a[1]) * u, z = a[2] + (b[2] - a[2]) * u;
+    p.distKm = Math.hypot(x, y, z);
+    p.marker.position.copy(j2000ToScene(x, y, z, pv));
+    // Label when the camera is far enough out for this probe to be in a sensible frame.
+    p.label.visible = labelsOn && camDist > 60 && p.distKm / RE_KM < camDist * 6 && p.distKm / RE_KM > camDist / 400;
+  }
+}
+setInterval(() => {
+  for (const p of probes) {
+    if (!p.marker.visible) continue;
+    const au = p.distKm / 1.496e8;
+    p.label.element.innerHTML = `${p.name}<small>${au < 0.1 ? Math.round(p.distKm / 1000).toLocaleString() + ' thousand km' : au.toFixed(au < 10 ? 2 : 1) + ' AU'} from Earth</small>`;
+  }
+}, 1000);
+
+
+let downAt = null;
+renderer.domElement.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 4) return;
+  const i = pick(e.clientX, e.clientY);
+  if (i >= 0) select(i);
+});
+const tooltip = $('tooltip');
+let hoverRaf = 0;
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (hoverRaf) return;
+  hoverRaf = requestAnimationFrame(() => {
+    hoverRaf = 0;
+    const i = pick(e.clientX, e.clientY);
+    if (i < 0) { tooltip.hidden = true; return; }
+    tooltip.hidden = false;
+    tooltip.textContent = `${catalog.names[i]} · ${catalog.regimes[i]}`;
+    tooltip.style.left = `${e.clientX + 12}px`; tooltip.style.top = `${e.clientY + 12}px`;
+  });
+});
+
+function renderSelection() {
+  if (selected < 0) return;
+  const p = new THREE.Vector3(); satPos(selected, p);
+  // Scene axes → ECI km → geodetic (WGS-72 ellipsoid, as SGP4 uses).
+  const g = eciToGeodetic({ x: p.x * RE_KM, y: -p.z * RE_KM, z: p.y * RE_KM }, currentGmst);
+  const alt = g.height;
+  const lat = THREE.MathUtils.radToDeg(g.latitude);
+  const lon = THREE.MathUtils.radToDeg(g.longitude);
+  const epoch = new Date(catalog.epochs[selected].endsWith('Z') ? catalog.epochs[selected] : catalog.epochs[selected] + 'Z');
+  const ageH = (Date.now() - epoch.getTime()) / 3600000;
+  $('sel-body').innerHTML = `
+    <dt>NORAD ID</dt><dd>${catalog.ids[selected]}</dd>
+    <dt>Regime</dt><dd>${catalog.regimes[selected]}</dd>
+    <dt>Altitude</dt><dd>${Math.round(alt).toLocaleString()} km</dd>
+    <dt>Speed</dt><dd>${selVel.length().toFixed(2)} km/s</dd>
+    <dt>Period</dt><dd>${catalog.periods[selected].toFixed(1)} min</dd>
+    <dt>Over</dt><dd>${Math.abs(lat).toFixed(1)}°${lat >= 0 ? 'N' : 'S'} ${Math.abs(lon).toFixed(1)}°${lon >= 0 ? 'E' : 'W'}</dd>
+    <dt>Elements</dt><dd>${ageH < 48 ? ageH.toFixed(1) + ' h' : (ageH / 24).toFixed(1) + ' d'} old<small>position is an SGP4 prediction</small></dd>`;
+}
+
+// search
+const searchEl = $('search'), resultsEl = $('search-results');
+searchEl.addEventListener('input', () => {
+  resultsEl.innerHTML = '';
+  if ($('only-matches').checked) applyFilters();
+  const q = searchEl.value.trim().toUpperCase();
+  if (!q || !catalog) return;
+  let shown = 0;
+  for (let i = 0; i < N && shown < 8; i++) {
+    if (catalog.dead[i] || !(catalog.names[i].toUpperCase().includes(q) || catalog.ids[i] === q)) continue;
+    const li = document.createElement('li');
+    li.textContent = catalog.names[i];
+    li.onclick = () => { select(i); flyToSatellite(i); resultsEl.innerHTML = ''; if (!$('only-matches').checked) searchEl.value = ''; };
+    resultsEl.appendChild(li); shown++;
+  }
+});
+searchEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') resultsEl.firstChild?.click(); });
+
+function flyToSatellite(i) {
+  const p = new THREE.Vector3(); satPos(i, p);
+  if (p.lengthSq() === 0) return;
+  const r = p.length();
+  setScaleValue(distToScale(Math.max(r * 1.8, 1.9)));
+  camDir.copy(p).normalize();
+  flyDir = true;
+}
+
+// ----------------------------------------------------------- scale slider
+const STOPS = [
+  { name: 'Surface & aurora', dist: 1.9, desc: 'Close in: the aurora oval (NOAA OVATION forecast, ~30–90 min ahead), the ISS and the dense low-orbit shell. Night side is unlit.' },
+  { name: 'Low Earth orbit', dist: 3.4, desc: 'LEO (below ~2,000 km): Starlink, OneWeb, the ISS and most of the catalog. Objects lap the planet every ~90–120 minutes.' },
+  { name: 'Navigation orbits', dist: 10, desc: 'Medium Earth orbit (~20,000 km): GPS, Galileo, GLONASS and BeiDou, each orbiting about twice a day.' },
+  { name: 'Geostationary belt', dist: 19, desc: 'GEO ring at 35,786 km. The cyan shell is the magnetopause, where Earth\'s magnetic field holds off the solar wind; it shrinks when wind pressure rises.' },
+  { name: 'Earth–Moon', dist: 150, desc: 'The Moon at ~384,000 km (60 Earth radii). Satellites collapse into a speck at this scale. Moon position: low-precision ephemeris.' },
+  { name: 'Sun–Earth L1', dist: 800, desc: '1.5 million km sunward: ACE and DSCOVR measure the solar wind here. The stream shows the last hour of those measurements on its way to Earth, coloured by speed.' },
+  { name: 'Inner solar system', dist: 1.3e5, desc: 'Mercury, Venus, Earth and Mars where they are today, from NASA JPL orbital elements. Earth is 1 AU (150 million km) from the Sun; light takes 8 minutes to cross it.' },
+  { name: 'Outer solar system', dist: 2.4e6, desc: 'Jupiter to Neptune, with the probes heading out. Neptune is 30 AU away, over 4 light-hours. Try 30 d/s to watch the inner planets lap the outer ones.' },
+  { name: 'Voyagers & the heliosphere', dist: 2.2e7, desc: 'The heliopause, ~120 AU out, is where the solar wind meets interstellar space. Voyager 1 crossed it in 2012 and Voyager 2 in 2018. Pluto, Eris and the other dwarf planets are on real JPL orbits; Sedna’s reaches ~1,000 AU.' },
+  { name: 'Oort cloud', dist: 7e9, desc: 'A theorised shell of icy bodies 2,000–100,000 AU out, thought to send us long-period comets. It has never been observed directly; the points are an impression, not data.' },
+  { name: 'Nearest stars', dist: 9e10, desc: 'Our stellar neighbours at their measured distances: Proxima Centauri 4.25 light-years, Barnard’s Star 6, Sirius 8.6. Voyager 1 would take ~73,000 years to cover Proxima’s distance.' },
+  { name: 'Milky Way', dist: 2.8e14, desc: 'Our galaxy, ~100,000 light-years across (schematic arms). The Sun sits ~26,700 light-years from the centre and takes ~230 million years to go round once.' },
+];
+STOPS.forEach((st, i) => { st.short = ['Surface', 'LEO', 'Nav', 'GEO', 'Moon', 'L1', 'Inner', 'Outer', 'Helio', 'Oort', 'Stars', 'Galaxy'][i]; });
+const slider = $('scale-slider');
+slider.max = String(STOPS.length - 1);
+$('scale-ticks').innerHTML = STOPS.map((s, i) => `<span data-i="${i}" style="left:${(i / (STOPS.length - 1)) * 100}%">${s.short}</span>`).join('');
+$('scale-ticks').querySelectorAll('span').forEach((el) => { el.onclick = () => setScaleValue(Number(el.dataset.i)); });
+
+function scaleToDist(v) {
+  const i = Math.min(Math.floor(v), STOPS.length - 2), f = v - i;
+  return Math.exp(Math.log(STOPS[i].dist) * (1 - f) + Math.log(STOPS[i + 1].dist) * f);
+}
+function distToScale(d) {
+  if (d <= STOPS[0].dist) return 0;
+  for (let i = 0; i < STOPS.length - 1; i++) {
+    if (d <= STOPS[i + 1].dist) return i + (Math.log(d) - Math.log(STOPS[i].dist)) / (Math.log(STOPS[i + 1].dist) - Math.log(STOPS[i].dist));
+  }
+  return STOPS.length - 1;
+}
+
+let targetDist = null; // when set, camera eases (in log space) toward it
+const camDir = new THREE.Vector3();
+let flyDir = false;
+let viewMode = null;
+// Ecliptic north in scene axes: planets' orbits lie flat when seen from here.
+const ECL_NORTH = new THREE.Vector3(0, Math.cos(OBLIQ), Math.sin(OBLIQ));
+function setScaleValue(v) {
+  slider.value = String(v); targetDist = scaleToDist(v); updateScaleText(v);
+  if (following) return;
+  if (v >= 10.5 && viewMode !== 'galaxy') {
+    // Galaxy: look down from above the galactic plane at a slant.
+    viewMode = 'galaxy';
+    camDir.copy(NGP_SCENE).multiplyScalar(0.8).addScaledVector(GC_SCENE.clone().normalize(), -0.6).normalize();
+    flyDir = true;
+  } else if (v >= 5.5 && v < 10.5 && viewMode !== 'ecliptic') {
+    // Solar system: look down on the ecliptic at a slant so orbits read as ellipses.
+    viewMode = 'ecliptic';
+    camDir.crossVectors(sunDir, ECL_NORTH).normalize().multiplyScalar(0.55).addScaledVector(ECL_NORTH, 0.85).normalize();
+    flyDir = true;
+  } else if (v >= 3.5 && v < 5.5 && viewMode !== 'side') {
+    // Moon / L1: side-on to the Sun–Earth line so Earth, Moon and L1 are all in frame.
+    viewMode = 'side';
+    camDir.crossVectors(sunDir, new THREE.Vector3(0, 1, 0)).normalize().multiplyScalar(0.95).add(new THREE.Vector3(0, 0.3, 0)).normalize();
+    flyDir = true;
+  } else if (v < 3.5) viewMode = null;
+}
+slider.addEventListener('input', () => setScaleValue(Number(slider.value)));
+
+let lastStop = -1;
+function updateScaleText(v) {
+  const i = Math.round(v);
+  if (i === lastStop) return;
+  lastStop = i;
+  $('scale-title').textContent = STOPS[i].name;
+  $('scale-desc').textContent = STOPS[i].desc;
+  $('scale-ticks').querySelectorAll('span').forEach((el, j) => el.classList.toggle('on', j === i));
+}
+
+const wantTarget = new THREE.Vector3();
+function updateCamera(dt) {
+  const off = camera.position.clone().sub(controls.target);
+  let dist = off.length();
+  if (targetDist !== null) {
+    const k = 1 - Math.exp(-dt * 4);
+    dist = Math.exp(Math.log(dist) + (Math.log(targetDist) - Math.log(dist)) * k);
+    if (Math.abs(Math.log(dist / targetDist)) < 0.002) { dist = targetDist; targetDist = null; }
+  }
+  const dir = off.normalize();
+  if (following && selected >= 0) {
+    const p = new THREE.Vector3(); satPos(selected, p);
+    if (p.lengthSq() > 0) dir.lerp(p.normalize(), 1 - Math.exp(-dt * 3)).normalize();
+  } else if (flyDir) {
+    dir.lerp(camDir, 1 - Math.exp(-dt * 3)).normalize();
+    if (dir.angleTo(camDir) < 0.002) flyDir = false;
+  }
+  // Centre on Earth up to L1, then glide to the Sun for the planets.
+  const scale = targetDist !== null ? Number(slider.value) : distToScale(dist);
+  wantTarget.copy(sunScene).multiplyScalar(THREE.MathUtils.smoothstep(scale, 5.15, 6))
+    .addScaledVector(GC_SCENE, THREE.MathUtils.smoothstep(scale, 10.1, 11));
+  controls.target.lerp(wantTarget, 1 - Math.exp(-dt * 5));
+  camera.position.copy(controls.target).addScaledVector(dir, dist);
+  sky.position.copy(camera.position);
+  if (targetDist === null) { slider.value = String(distToScale(dist)); updateScaleText(Number(slider.value)); }
+
+  // Point size grows a touch when zoomed in; selection/labels adapt to scale.
+  satMat.uniforms.size.value = dist < 4 ? 3.2 : dist < 25 ? 2.6 : 2;
+  controls.rotateSpeed = dist > 50 ? 0.6 : 1;
+  updateLabelVisibility(dist);
+}
+
+function updateLabelVisibility(dist = camera.position.length()) {
+  const on = $('layer-labels').checked;
+  issLabel.visible = on && dist < 30;
+  moonLabel.visible = on && dist > 25 && dist < 5000;
+  earthLabel.visible = on && dist > 60 && dist < 3e8;
+  l1Label.visible = on && dist > 80 && dist < 5000;
+  sunLabel.visible = on && dist > 80 && dist < 2e9;
+  for (const p of PLANETS) {
+    if (p.label) p.label.visible = on && dist > 3000;
+    p.orbit.visible = dist > 3000; // closer in they only cut across the view as straight lines
+  }
+  earthMarker.visible = dist > 3000;
+  moonOrbit.visible = $('layer-orbits').checked && dist > 20 && dist < 20000;
+  auroraPoints.visible = $('layer-aurora').checked && dist < 12;
+  mpLabel.visible = on && dist > 8 && dist < 120;
+}
+
+// ------------------------------------------------------------ aurora layer
+const auroraPoints = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({
+  size: 0.026, vertexColors: true, transparent: true, opacity: 0.55, depthWrite: false, blending: THREE.AdditiveBlending, map: dotTex,
+}));
+earthGroup.add(auroraPoints);
+$('layer-aurora').addEventListener('change', () => updateLabelVisibility());
+
+// ----------------------------------------------------------- space weather
+const wx = { wind: null, mag: null, xray: null, aurora: null };
+const parseTime = (s) => new Date(String(s).replace(' ', 'T').replace(/(\.\d+)?Z?$/, 'Z'));
+
+function latest(rows, field, filter = () => true) {
+  if (!Array.isArray(rows)) return null;
+  const ok = rows.filter((r) => r && r[field] != null && Number.isFinite(Number(r[field])) && filter(r));
+  if (!ok.length) return null;
+  const active = ok.filter((r) => r.active !== false);
+  const pool = active.length ? active : ok;
+  return pool.reduce((a, b) => (parseTime(a.time_tag) > parseTime(b.time_tag) ? a : b));
+}
+
+async function fetchJson(key) {
+  const res = await fetch(`/api/data/${key}`);
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+  noteDemo(res);
+  return res.json();
+}
+
+async function pollWeather() {
+  await Promise.all(['wind', 'mag', 'xray'].map(async (k) => {
+    try { wx[k] = { data: await fetchJson(k), error: null }; } catch (e) { wx[k] = { ...(wx[k] || {}), error: String(e.message || e) }; }
+  }));
+  rebuildWindSeries();
+}
+
+async function pollAurora() {
+  try {
+    const data = await fetchJson('aurora');
+    wx.aurora = { data, error: null };
+    const pts = [], cols = [], c = new THREE.Color();
+    for (const [lon, lat, v] of data.coordinates || []) {
+      // OVATION's grid carries a spurious non-zero row on the equator; real aurora
+      // stays poleward of ~30° even in extreme storms.
+      if (v < 4 || Math.abs(lat) < 30) continue;
+      pts.push(lonLatToVec(lon, lat, 1.012));
+      const t = Math.min(v / 30, 1); // OVATION values are % probability; >30 is a strong display
+      c.setRGB(0.15 + 0.85 * Math.max(0, t - 0.5) * 2, 0.9 - 0.4 * t, 0.35); // green → red as intensity rises
+      cols.push(c.r * (0.4 + t), c.g * (0.4 + t), c.b * (0.4 + t));
+    }
+    auroraPoints.geometry.dispose();
+    auroraPoints.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+    auroraPoints.geometry.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+  } catch (e) { wx.aurora = { ...(wx.aurora || {}), error: String(e.message || e) }; }
+}
+
+function ago(t) {
+  const s = (Date.now() - t) / 1000;
+  if (!Number.isFinite(s)) return '—';
+  if (s < 90) return `${Math.max(0, Math.round(s))} s ago`;
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 172800) return `${(s / 3600).toFixed(1)} h ago`;
+  return `${(s / 86400).toFixed(1)} d ago`;
+}
+function dot(ageMs, freshMs) {
+  return `<span class="dot ${ageMs < freshMs ? 'ok' : ageMs < freshMs * 4 ? 'stale' : 'bad'}"></span>`;
+}
+function xrayClass(flux) {
+  const classes = [['X', 1e-4], ['M', 1e-5], ['C', 1e-6], ['B', 1e-7], ['A', 1e-8]];
+  for (const [k, base] of classes) if (flux >= base) return `${k}${(flux / base).toFixed(1)}`;
+  return '<A';
+}
+
+function renderWeather() {
+  const rows = [];
+  const w = latest(wx.wind?.data, 'proton_speed');
+  const d = latest(wx.wind?.data, 'proton_density');
+  const b = latest(wx.mag?.data, 'bz_gsm');
+  const x = latest(wx.xray?.data, 'flux', (r) => r.energy === '0.1-0.8nm');
+  if (w) {
+    const t = parseTime(w.time_tag);
+    const v = Number(w.proton_speed);
+    rows.push(`<dt>${dot(Date.now() - t, 5 * 60000)}Solar wind</dt><dd>${Math.round(v)} km/s<small>measured ${ago(t)} · reaches Earth in ~${Math.round(1.5e6 / v / 60)} min</small></dd>`);
+    l1Label.element.innerHTML = `Sun–Earth L1 <small>solar wind ${Math.round(v)} km/s · ~${Math.round(1.5e6 / v / 60)} min to Earth</small>`;
+  } else rows.push(`<dt>Solar wind</dt><dd class="muted">${wx.wind?.error ? 'unavailable' : 'loading…'}</dd>`);
+  if (d) rows.push(`<dt>Density</dt><dd>${Number(d.proton_density).toFixed(1)} p/cm³</dd>`);
+  if (b) {
+    const bz = Number(b.bz_gsm), t = parseTime(b.time_tag);
+    rows.push(`<dt>${dot(Date.now() - t, 5 * 60000)}IMF Bz</dt><dd class="${bz < 0 ? 'south' : 'north'}">${bz.toFixed(1)} nT<small>${bz < -5 ? 'strongly south — aurora likely to strengthen' : bz < 0 ? 'southward — energy coupling in' : 'northward — quiet coupling'}</small></dd>`);
+  } else rows.push(`<dt>IMF Bz</dt><dd class="muted">${wx.mag?.error ? 'unavailable' : 'loading…'}</dd>`);
+  if (x) {
+    const t = parseTime(x.time_tag);
+    rows.push(`<dt>${dot(Date.now() - t, 10 * 60000)}X-ray flux</dt><dd>${xrayClass(Number(x.flux))}<small>GOES · ${ago(t)}</small></dd>`);
+  } else rows.push(`<dt>X-ray flux</dt><dd class="muted">${wx.xray?.error ? 'unavailable' : 'loading…'}</dd>`);
+  const a = wx.aurora?.data;
+  if (a) {
+    const t = parseTime(a['Observation Time']);
+    rows.push(`<dt>${dot(Date.now() - t, 20 * 60000)}Aurora</dt><dd>forecast<small>model run from ${ago(t)} data · not an observation</small></dd>`);
+  }
+  $('wx').innerHTML = rows.join('') + windRows().join('');
+}
+
+function renderFreshness() {
+  const now = Date.now();
+  const rows = [];
+  if (freshness.gp) {
+    rows.push(`<dt>${dot(now - freshness.gp, 3 * 3600000)}Orbits</dt><dd>${ago(freshness.gp)}<small>CelesTrak elements · refetched ≤ every 2 h</small></dd>`);
+  } else rows.push(`<dt><span class="dot bad"></span>Orbits</dt><dd>${freshness.gpError ? 'unavailable' : 'loading…'}<small>${freshness.gpError ?? ''}</small></dd>`);
+  if (freshness.gpError && freshness.gp) rows.push(`<dt></dt><dd><small>last refresh failed: serving cached copy</small></dd>`);
+  const newest = snaps[snaps.length - 1];
+  rows.push(`<dt>Positions</dt><dd>${newest ? 'SGP4 · 1 Hz' : '—'}<small>interpolated to frame rate${correctionsApplied ? ` · ${correctionsApplied} smooth correction${correctionsApplied > 1 ? 's' : ''}` : ''}</small></dd>`);
+  rows.push(`<dt>ISS sensors</dt><dd>${iss.lastUpdate ? ago(iss.lastUpdate) : '—'}<small>${iss.status}</small></dd>`);
+  $('freshness').innerHTML = rows.join('');
+}
+
+let demoShown = false;
+function noteDemo(res) {
+  const mode = res.headers.get('X-Demo');
+  if (demoShown || (mode !== '1' && mode !== 'snapshot')) return;
+  demoShown = true;
+  if (mode === 'snapshot') {
+    // Real data bundled into the page at publish time (no live fetching available).
+    const at = new Date(Number(res.headers.get('X-Fetched-At'))).toISOString().replace('T', ' ').slice(0, 16);
+    $('demo-banner').textContent = `REAL DATA SNAPSHOT · ${at} UTC · satellites move live from real orbits; space weather is frozen at this time`;
+    $('demo-banner').classList.add('snapshot');
+  }
+  $('demo-banner').hidden = false;
+  document.body.classList.add('demo');
+}
+
+// ------------------------------------------------------- ISS live telemetry
+// NASA's public ISS telemetry via Lightstreamer (adapter set ISSLIVE).
+// Channel meanings follow the community ISS Mimic dictionary — treat labels
+// as best-effort. Values only change while the station has a ground link
+// (TIME_000001 Status.Class === "24" means signal acquired).
+const ISS_CHANNELS = {
+  // ISSLive reports this in mmHg (~760 at sea-level pressure).
+  USLAB000058: { label: 'Cabin pressure (Lab)', fmt: (v) => `${(Number(v) * 0.0193368).toFixed(2)} psi<small>${Math.round(Number(v))} mmHg</small>` },
+  USLAB000059: { label: 'Cabin temp (Lab)', fmt: (v) => `${Number(v).toFixed(1)} °C` },
+  NODE3000001: { label: 'O₂ partial pressure', fmt: (v) => `${Number(v).toFixed(1)} mmHg` },
+  NODE3000003: { label: 'CO₂ partial pressure', fmt: (v) => `${Number(v).toFixed(2)} mmHg` },
+};
+const iss = { values: {}, lastUpdate: 0, signal: null, status: 'connecting' };
+
+async function startIssTelemetry() {
+  try {
+    const { LightstreamerClient, Subscription } = await import('/vendor/lightstreamer-client-web/lightstreamer-core.esm.js');
+    const client = new LightstreamerClient('https://push.lightstreamer.com', 'ISSLIVE');
+    client.addListener({ onStatusChange: (s) => { iss.status = s.startsWith('CONNECTED') ? 'connected' : s.toLowerCase(); renderIss(); } });
+    const sub = new Subscription('MERGE', Object.keys(ISS_CHANNELS), ['Value', 'TimeStamp']);
+    sub.addListener({ onItemUpdate: (u) => { iss.values[u.getItemName()] = u.getValue('Value'); iss.lastUpdate = Date.now(); renderIss(); } });
+    const time = new Subscription('MERGE', ['TIME_000001'], ['TimeStamp', 'Value', 'Status.Class']);
+    time.addListener({ onItemUpdate: (u) => { iss.signal = u.getValue('Status.Class') === '24'; renderIss(); } });
+    client.subscribe(sub);
+    client.subscribe(time);
+    client.connect();
+  } catch (e) {
+    iss.status = `unavailable (${e.message || e})`;
+    renderIss();
+  }
+}
+function renderIss() {
+  $('iss-signal').innerHTML = iss.signal === null
+    ? `<span class="muted">${iss.status}</span>`
+    : iss.signal
+      ? '<span class="dot ok"></span>Signal acquired — values are live'
+      : '<span class="dot stale"></span>Loss of signal — values frozen at last downlink';
+  $('iss-tm').innerHTML = Object.entries(ISS_CHANNELS).map(([id, ch]) => {
+    const v = iss.values[id];
+    return `<dt title="${id}">${ch.label}</dt><dd>${v == null || v === '' || Number.isNaN(Number(v)) ? '—' : ch.fmt(v)}</dd>`;
+  }).join('');
+}
+
+// ------------------------------------------------------- solar wind stream
+// Particles flow from L1 toward Earth. A particle is a parcel of plasma that
+// passed L1 `age` seconds ago; it carries the measurement from that moment and
+// sits where that measured speed has carried it. So the stream is the last
+// ~hour of real L1 data laid out in space, fast wind overtaking slow wind piles
+// up into a front, and arrival times follow each parcel's own speed. The
+// animation can be sped up (the real trip takes ~40–90 min).
+// Around Earth the flow is pushed aside by the bow shock / magnetopause, whose
+// size comes from the Shue et al. (1998) model driven by the wind hitting now.
+const L1_KM = 1.5e6;
+const WIND_N = 3500;
+const WIND_R = 28; // half-width of the drawn stream, Earth radii
+const windA = new Float32Array(WIND_N), windU = new Float32Array(WIND_N), windV = new Float32Array(WIND_N), windK = new Float32Array(WIND_N);
+for (let i = 0; i < WIND_N; i++) {
+  windA[i] = -1; // seeded on first update
+  const a = Math.random() * Math.PI * 2, r = Math.sqrt(Math.random()) * WIND_R;
+  windU[i] = r * Math.cos(a); windV[i] = r * Math.sin(a); windK[i] = Math.random();
+}
+const windGeom = new THREE.BufferGeometry();
+windGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(WIND_N * 3), 3).setUsage(THREE.DynamicDrawUsage));
+windGeom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(WIND_N * 3), 3).setUsage(THREE.DynamicDrawUsage));
+const windPoints = new THREE.Points(windGeom, new THREE.PointsMaterial({
+  size: 2.4, sizeAttenuation: false, vertexColors: true, map: dotTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+}));
+windPoints.frustumCulled = false;
+scene.add(windPoints);
+
+let windSeries = []; // [{t, v, n, bz}] ascending
+function rebuildWindSeries() {
+  const byMin = new Map();
+  const put = (row, fields) => {
+    const t = parseTime(row.time_tag).getTime();
+    if (!Number.isFinite(t)) return;
+    const k = Math.round(t / 60000);
+    const e = byMin.get(k) || { t: k * 60000 };
+    for (const [src, dst] of fields) {
+      const v = Number(row[src]);
+      if (row[src] == null || !Number.isFinite(v)) continue;
+      if (e[dst] === undefined || row.active !== false) e[dst] = v; // prefer the active spacecraft
+    }
+    byMin.set(k, e);
+  };
+  for (const r of Array.isArray(wx.wind?.data) ? wx.wind.data : []) put(r, [['proton_speed', 'v'], ['proton_density', 'n']]);
+  for (const r of Array.isArray(wx.mag?.data) ? wx.mag.data : []) put(r, [['bz_gsm', 'bz']]);
+  const rows = [...byMin.values()].sort((a, b) => a.t - b.t);
+  // carry values forward over gaps so every minute has a full record
+  let last = { v: 400, n: 5, bz: 0 };
+  windSeries = rows.map((r) => (last = { t: r.t, v: r.v ?? last.v, n: r.n ?? last.n, bz: r.bz ?? last.bz }))
+    .filter((r) => r.v > 100);
+}
+function windAt(t) {
+  const s = windSeries;
+  if (!s.length) return null;
+  if (t <= s[0].t) return s[0];
+  let lo = 0, hi = s.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (s[mid].t <= t) lo = mid; else hi = mid - 1; }
+  return s[lo];
+}
+const travelMs = (v) => (L1_KM / v) * 1000;
+
+// Shue et al. 1998 magnetopause: standoff r0 (Earth radii) and flaring α.
+function magnetopause(v, n, bz) {
+  const pd = 1.6726e-6 * n * v * v; // dynamic pressure, nPa
+  const r0 = (10.22 + 1.29 * Math.tanh(0.184 * (bz + 8.14))) * Math.pow(pd, -1 / 6.6);
+  const alpha = (0.58 - 0.007 * bz) * (1 + 0.024 * Math.log(pd));
+  return { pd, r0, alpha };
+}
+const shueR = (mp, cosT) => mp.r0 * Math.pow(2 / Math.max(1 + cosT, 0.04), mp.alpha);
+
+let mp = { pd: 2, r0: 10, alpha: 0.58 }; // what the wind arriving now produces
+let mpShown = null;
+const mpGroup = new THREE.Group();
+scene.add(mpGroup);
+const mpLabel = makeLabel('Magnetopause');
+mpGroup.add(mpLabel);
+function rebuildMagnetopause() {
+  if (mpShown && Math.abs(mpShown.r0 - mp.r0) < 0.05 && Math.abs(mpShown.alpha - mp.alpha) < 0.005) return;
+  mpShown = { ...mp };
+  for (const c of [...mpGroup.children]) if (c !== mpLabel) { mpGroup.remove(c); c.geometry.dispose(); }
+  const shape = (scale) => {
+    const pts = [];
+    for (let deg = 0; deg <= 105; deg += 5) {
+      const th = THREE.MathUtils.degToRad(deg), r = Math.min(shueR(mp, Math.cos(th)) * scale, 40);
+      pts.push(new THREE.Vector2(r * Math.sin(th), r * Math.cos(th)));
+    }
+    return new THREE.LatheGeometry(pts, 36);
+  };
+  const mk = (geo, color, opacity, wire) => new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    color, transparent: true, opacity, side: THREE.DoubleSide, depthWrite: false, wireframe: wire,
+  }));
+  const mpGeo = shape(1);
+  mpGroup.add(mk(mpGeo, 0x4dd0e1, 0.06, false), mk(mpGeo.clone(), 0x4dd0e1, 0.05, true));
+  mpGroup.add(mk(shape(1.3), 0xffcc80, 0.025, false)); // bow shock, roughly 1.3× standoff
+  mpLabel.position.set(0, mp.r0, 0);
+}
+function orientMagnetopause() {
+  mpGroup.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), sunDir);
+}
+
+let windTimeScale = 60;
+const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), wp = new THREE.Vector3();
+function speedColour(v, out) {
+  // 300 km/s slow → cool blue, ~450 typical → white, 700+ fast stream / CME → orange-red
+  const t = THREE.MathUtils.clamp((v - 300) / 400, 0, 1);
+  if (t < 0.4) out.setRGB(0.35 + t * 1.6, 0.6 + t, 1);
+  else out.setRGB(1, 1 - (t - 0.4) * 1.3, 1 - (t - 0.4) * 1.6);
+  return out;
+}
+const wc = new THREE.Color();
+function updateWind(dt, now) {
+  const latest = windSeries[windSeries.length - 1];
+  const on = $('layer-wind').checked && !!latest;
+  windPoints.visible = on;
+  const cd = camera.position.distanceTo(controls.target);
+  mpGroup.visible = on && cd > mp.r0 * 1.15 && cd < 100; // only from outside the shell, up to Moon scale
+  if (!on) return;
+  windStatus = windTimeline(now);
+  const arriving = windStatus.arriving;
+  if (arriving) { mp = magnetopause(arriving.v, Math.max(arriving.n, 0.1), arriving.bz); rebuildMagnetopause(); }
+  orientMagnetopause();
+
+  e1.crossVectors(sunDir, new THREE.Vector3(0, 1, 0));
+  if (e1.lengthSq() < 1e-6) e1.set(1, 0, 0);
+  e1.normalize(); e2.crossVectors(sunDir, e1).normalize();
+
+  const L1 = L1_KM / RE_KM;
+  const maxAge = (1.3 * L1_KM) / 300; // s: long enough for slow wind to pass Earth
+  const pos = windGeom.attributes.position.array, col = windGeom.attributes.color.array;
+  for (let i = 0; i < WIND_N; i++) {
+    if (windA[i] < 0) windA[i] = Math.random() * 1.3 * (L1_KM / latest.v);
+    let a = windA[i] + dt * windTimeScale;
+    let m = windAt(now - a * 1000);
+    let s = (a * m.v) / L1_KM; // fraction of the L1→Earth distance covered
+    if (s > 1.3 || a > maxAge) { a = 0; m = latest; s = 0; }
+    windA[i] = a;
+    const k = i * 3;
+    if (windK[i] > m.n / 14) { // denser wind → more of the stream is filled
+      pos[k] = pos[k + 1] = pos[k + 2] = 0; continue;
+    }
+    const x = (1 - s) * L1;
+    wp.copy(sunDir).multiplyScalar(x).addScaledVector(e1, windU[i]).addScaledVector(e2, windV[i]);
+    const r = wp.length();
+    const bs = Math.min(1.3 * shueR(mp, x / r), 60);
+    if (r < bs) wp.multiplyScalar(bs / r); // deflected around the bow shock
+    pos[k] = wp.x; pos[k + 1] = wp.y; pos[k + 2] = wp.z;
+    speedColour(m.v, wc);
+    const fade = s > 1 ? Math.max(0, 1 - (s - 1) / 0.3) : Math.min(1, s * 20 + 0.05);
+    col[k] = wc.r * fade; col[k + 1] = wc.g * fade; col[k + 2] = wc.b * fade;
+  }
+  windGeom.attributes.position.needsUpdate = true;
+  windGeom.attributes.color.needsUpdate = true;
+}
+
+// Who is where on the L1→Earth trip right now, using each parcel's own speed.
+let windStatus = { arriving: null, nextFront: null, latest: null };
+function windTimeline(now) {
+  const s = windSeries;
+  const latest = s[s.length - 1];
+  let arriving = null, front = null;
+  for (let i = s.length - 1; i >= 0; i--) { // newest → oldest
+    const r = s[i], eta = r.t + travelMs(r.v);
+    if (eta <= now) { arriving = r; break; }
+  }
+  arriving ??= s[0];
+  const pA = 1.6726e-6 * arriving.n * arriving.v * arriving.v;
+  let best = Infinity;
+  for (const r of s) { // a notably faster or harder-pushing parcel still in transit
+    const eta = r.t + travelMs(r.v);
+    if (eta <= now || eta >= best) continue;
+    const p = 1.6726e-6 * r.n * r.v * r.v;
+    if (r.v >= arriving.v + 75 || p >= 2 * pA) { best = eta; front = { ...r, eta, p }; }
+  }
+  return { arriving, nextFront: front, latest };
+}
+$('wind-speed').addEventListener('change', (e) => { windTimeScale = Number(e.target.value); });
+
+function hhmm(t) { return new Date(t).toISOString().slice(11, 16); }
+function windRows() {
+  const { arriving, nextFront, latest } = windStatus;
+  if (!latest || !arriving) return [];
+  const now = Date.now();
+  const eta = latest.t + travelMs(latest.v);
+  const mins = (t) => Math.max(0, Math.round((t - now) / 60000));
+  const press = mp.pd < 1 ? 'low' : mp.pd < 3 ? 'normal' : mp.pd < 6 ? 'elevated' : 'high';
+  const rows = [];
+  rows.push(`<dt>Hitting Earth now</dt><dd>${Math.round(arriving.v)} km/s · ${arriving.n.toFixed(1)} p/cm³<small>passed L1 at ${hhmm(arriving.t)} UTC, ${Math.round((now - arriving.t) / 60000)} min ago</small></dd>`);
+  if (nextFront) {
+    rows.push(`<dt class="south">Faster wind incoming</dt><dd class="south">${hhmm(nextFront.eta)} UTC<small>${Math.round(nextFront.v)} km/s · ${nextFront.p.toFixed(1)} nPa · arrives in ${mins(nextFront.eta)} min</small></dd>`);
+  }
+  rows.push(`<dt>Wind measured now</dt><dd>arrives ${hhmm(eta)} UTC<small>${Math.round(latest.v)} km/s · in ${mins(eta)} min</small></dd>`);
+  rows.push(`<dt>Wind pressure</dt><dd>${mp.pd.toFixed(1)} nPa<small>${press} · of the wind hitting now</small></dd>`);
+  rows.push(`<dt>Magnetopause</dt><dd>${mp.r0.toFixed(1)} R⊕<small>${Math.round(mp.r0 * RE_KM).toLocaleString()} km sunward${mp.r0 < GEO_R ? ' · inside GEO: geostationary satellites exposed' : ''}</small></dd>`);
+  rows.push(`<dt></dt><dd><span class="wind-legend"></span><small>slow 300 · 450 · 700+ km/s fast</small></dd>`);
+  mpLabel.element.innerHTML = `Magnetopause <small>${mp.r0.toFixed(1)} R⊕ · ${mp.pd.toFixed(1)} nPa</small>`;
+  return rows;
+}
+
+// ------------------------------------------------------------- deep space
+// Beyond the planets, everything below is heliocentric (inside solarGroup).
+// Measured: dwarf planets / comets (JPL elements), nearest stars (parallax
+// distances), Voyager heliopause crossings. Modelled, and labelled as such:
+// heliosphere shape, Oort cloud, Kuiper Belt particles, Milky Way structure.
+const LY_RE = 9.4607e12 / RE_KM;
+const deep = new THREE.Group();
+solarGroup.add(deep);
+const deepLabels = []; // [label, minDist, maxDist]
+function deepLabel(html, pos, min, max, parent = deep) {
+  const l = makeLabel(html);
+  l.position.copy(pos);
+  parent.add(l);
+  deepLabels.push([l, min, max]);
+  return l;
+}
+function cloudPoints(positions, colour, size, opacity) {
+  const g = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  const p = new THREE.Points(g, new THREE.PointsMaterial({ color: colour, size, sizeAttenuation: false, map: dotTex, transparent: true, opacity, depthWrite: false, blending: THREE.AdditiveBlending }));
+  p.frustumCulled = false;
+  deep.add(p);
+  return p;
+}
+const gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+// Two-body Kepler position from elements (AU, degrees) → ecliptic J2000, AU.
+function keplerEcl(a, e, i, om, w, Mdeg) {
+  const M = ((Mdeg % 360) + 360) % 360 * D2R;
+  let E = e < 0.8 ? M : Math.PI;
+  for (let k = 0; k < 30; k++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+  const xp = a * (Math.cos(E) - e), yp = a * Math.sqrt(1 - e * e) * Math.sin(E);
+  const W = w * D2R, O = om * D2R, I = i * D2R;
+  const cw = Math.cos(W), sw = Math.sin(W), cO = Math.cos(O), sO = Math.sin(O), cI = Math.cos(I), sI = Math.sin(I);
+  return {
+    x: (cw * cO - sw * sO * cI) * xp + (-sw * cO - cw * sO * cI) * yp,
+    y: (cw * sO + sw * cO * cI) * xp + (-sw * sO + cw * cO * cI) * yp,
+    z: sw * sI * xp + cw * sI * yp,
+  };
+}
+
+// Dwarf planets, Sedna, Arrokoth, Halley's Comet (public/smallbodies.json).
+const smallBodies = [];
+fetch('/smallbodies.json').then((r) => r.json()).then(({ bodies }) => {
+  for (const b of bodies) {
+    const pts = [];
+    for (let k = 0; k <= 720; k++) {
+      // sample by eccentric anomaly so long, thin orbits stay smooth
+      const E = (k / 720) * 2 * Math.PI, M = (E - b.e * Math.sin(E)) / D2R;
+      pts.push(eclToScene(keplerEcl(b.a, b.e, b.i, b.om, b.w, M)));
+    }
+    const orbit = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: b.name.startsWith('Halley') ? 0x9fd7ff : 0xb9a7ff, transparent: true, opacity: 0.35 }));
+    orbit.frustumCulled = false;
+    deep.add(orbit);
+    const marker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+      new THREE.PointsMaterial({ color: 0xd8ccff, size: 5, sizeAttenuation: false, map: dotTex, alphaTest: 0.5, transparent: true }));
+    marker.frustumCulled = false;
+    const label = makeLabel(b.name);
+    label.element.title = b.note;
+    marker.add(label);
+    deep.add(marker);
+    smallBodies.push({ ...b, orbit, marker, label });
+  }
+}).catch((e) => console.warn('small bodies', e));
+
+// Kuiper Belt: a particle impression of the 30–50 AU region (not individual objects).
+{
+  const pos = [];
+  for (let k = 0; k < 5000; k++) {
+    const r = k % 3 ? 42 + gauss() * 2.5 : 30 + Math.random() * 20;   // "classical" belt near 42–47 AU
+    const lon = Math.random() * 2 * Math.PI, lat = gauss() * (k % 3 ? 2.5 : 8) * D2R;
+    pos.push(...eclToScene({ x: r * Math.cos(lat) * Math.cos(lon), y: r * Math.cos(lat) * Math.sin(lon), z: r * Math.sin(lat) }).toArray());
+  }
+  var kuiper = cloudPoints(pos, 0x8fa3c8, 1.4, 0.45);
+  deepLabel('Kuiper Belt <small>30–50 AU · impression of the region</small>', eclToScene({ x: 0, y: -46, z: 0 }), 4e5, 6e7);
+}
+
+// Heliosphere. Nose points into the interstellar wind (from ecliptic longitude
+// 255.4°, latitude 5.2°). Distances anchored to the Voyager crossings:
+// termination shock 94 AU (V1, 2004) / 84 AU (V2, 2007); heliopause 121.6 AU
+// (V1, 2012) / 119 AU (V2, 2018). The flank and tail shape is a model.
+const NOSE = eclToScene({ x: Math.cos(5.2 * D2R) * Math.cos(255.4 * D2R), y: Math.cos(5.2 * D2R) * Math.sin(255.4 * D2R), z: Math.sin(5.2 * D2R) }).normalize();
+const helio = new THREE.Group();
+helio.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), NOSE);
+deep.add(helio);
+function helioShell(rNose, stretch, maxDeg, colour, opacity) {
+  const pts = [];
+  for (let d = 0; d <= maxDeg; d += 6) {
+    const t = d * D2R, r = rNose * (1 + stretch * (1 - Math.cos(t)));
+    pts.push(new THREE.Vector2(r * Math.sin(t) * AU_RE, r * Math.cos(t) * AU_RE));
+  }
+  const g = new THREE.LatheGeometry(pts, 32);
+  helio.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: opacity * 0.4, side: THREE.DoubleSide, depthWrite: false })));
+  helio.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: opacity * 0.7, wireframe: true, depthWrite: false })));
+}
+helioShell(90, 0.45, 180, 0x6fa8ff, 0.035);   // termination shock
+helioShell(121, 1.1, 150, 0x9f8cff, 0.03);    // heliopause (open tail)
+deepLabel('Heliopause <small>edge of the Sun’s bubble · ~120 AU at the nose</small>', NOSE.clone().multiplyScalar(125 * AU_RE), 2e6, 3e9);
+deepLabel('Termination shock <small>solar wind slows abruptly · 84–94 AU</small>', NOSE.clone().multiplyScalar(-150 * AU_RE), 3e6, 1.5e8);
+
+// Oort cloud: theorised shell of icy bodies, 2,000–100,000 AU (never observed directly).
+{
+  const pos = [];
+  for (let k = 0; k < 9000; k++) {
+    const r = Math.exp(Math.log(2000) + Math.random() * Math.log(50)) * AU_RE;
+    const v = new THREE.Vector3().randomDirection().multiplyScalar(r);
+    pos.push(v.x, v.y, v.z);
+  }
+  var oort = cloudPoints(pos, 0x9fb7d9, 1.3, 0.35);
+  deepLabel('Oort cloud <small>theorised · 2,000–100,000 AU · source of long-period comets</small>', new THREE.Vector3(0, 60000 * AU_RE, 0), 4e8, 2e11);
+}
+
+// Nearest stars at their measured distances (RA/Dec J2000 degrees, light-years).
+const NEAR_STARS = [
+  ['Proxima Centauri', 217.429, -62.680, 4.25, 0xff9a6a], ['Alpha Centauri A & B', 219.900, -60.835, 4.37, 0xfff1d6],
+  ["Barnard's Star", 269.452, 4.693, 5.96, 0xff9a6a], ['Wolf 359', 164.120, 7.015, 7.86, 0xff8a5a],
+  ['Lalande 21185', 165.836, 35.970, 8.31, 0xffa76a], ['Sirius', 101.287, -16.716, 8.60, 0xcfe0ff],
+  ['Luyten 726-8', 24.750, -17.950, 8.73, 0xff8a5a], ['Ross 154', 282.455, -23.836, 9.70, 0xff9a6a],
+  ['Ross 248', 355.479, 44.178, 10.3, 0xff8a5a], ['Epsilon Eridani', 53.233, -9.458, 10.5, 0xffd2a0],
+  ['Lacaille 9352', 346.467, -35.853, 10.7, 0xffa76a], ['Ross 128', 176.935, 0.804, 11.0, 0xff9a6a],
+  ['61 Cygni', 316.725, 38.749, 11.4, 0xffc48a], ['Procyon', 114.825, 5.225, 11.5, 0xfff6e8],
+  ['Epsilon Indi', 330.840, -56.786, 11.9, 0xffc48a], ['Tau Ceti', 26.017, -15.938, 11.9, 0xffe6c0],
+  ["Teegarden's Star", 43.254, 16.881, 12.5, 0xff7a4a], ["Kapteyn's Star", 77.919, -45.018, 12.8, 0xffa76a],
+  ['Altair', 297.696, 8.868, 16.7, 0xf4f7ff], ['Vega', 279.235, 38.784, 25.0, 0xdfe8ff],
+  ['Fomalhaut', 344.413, -29.622, 25.1, 0xeef3ff], ['Arcturus', 213.915, 19.182, 36.7, 0xffc98a],
+];
+const nearStars = new THREE.Group();
+deep.add(nearStars);
+for (const [name, ra, dec, ly, colour] of NEAR_STARS) {
+  const pos = raDecToVec(ra, dec, ly * LY_RE);
+  const m = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(pos.toArray(), 3)),
+    new THREE.PointsMaterial({ color: colour, size: ly < 13 ? 6 : 7, sizeAttenuation: false, map: dotTex, transparent: true, depthWrite: false }));
+  m.frustumCulled = false;
+  nearStars.add(m);
+  deepLabel(`${name}<small>${ly} light-years</small>`, pos, 2e9, 4e11, nearStars);
+}
+deepLabel('The Sun', new THREE.Vector3(), 2e9, 2e12);
+
+// Milky Way: schematic model (bulge, bar, four trailing log-spiral arms, disc).
+// Real: its orientation (galactic coordinates → J2000) and the Sun's place,
+// ~26,700 ly from the centre, between the Sagittarius and Perseus arms.
+const R0_LY = 26670;
+const GAL_TO_EQ = [[-0.0548755604, -0.8734370902, -0.4838350155], [0.4941094279, -0.4448296300, 0.7469822445], [-0.8676661490, -0.1980763734, 0.4559837762]];
+function galToScene(x, y, z, out = new THREE.Vector3()) { // galactic (Sun-centred, ly) → scene
+  const ex = x * GAL_TO_EQ[0][0] + y * GAL_TO_EQ[1][0] + z * GAL_TO_EQ[2][0];
+  const ey = x * GAL_TO_EQ[0][1] + y * GAL_TO_EQ[1][1] + z * GAL_TO_EQ[2][1];
+  const ez = x * GAL_TO_EQ[0][2] + y * GAL_TO_EQ[1][2] + z * GAL_TO_EQ[2][2];
+  return out.set(ex, ez, -ey).multiplyScalar(LY_RE);
+}
+const GC_SCENE = galToScene(R0_LY, 0, 0);
+const NGP_SCENE = galToScene(0, 0, 1).normalize();
+{
+  const pos = [], col = [];
+  const add = (gx, gy, gz, r, g, b) => { // gx,gy,gz relative to the galactic centre
+    const v = galToScene(R0_LY + gx, gy, gz);
+    pos.push(v.x, v.y, v.z); col.push(r * 0.22, g * 0.22, b * 0.22);
+  };
+  const barAngle = 27 * D2R;
+  for (let k = 0; k < 6000; k++) { // bulge + bar
+    const t = gauss() * 9000, w = gauss() * 2600;
+    add(-(t * Math.cos(barAngle) - w * Math.sin(barAngle)), t * Math.sin(barAngle) + w * Math.cos(barAngle), gauss() * 900, 1.0, 0.82, 0.55);
+  }
+  const b = Math.tan(12 * D2R);
+  for (let arm = 0; arm < 4; arm++) {
+    for (let k = 0; k < 9000; k++) {
+      const phi = Math.random() * 1.75 * Math.PI;
+      const r = 10500 * Math.exp(b * phi);
+      if (r > 52000) continue;
+      const th = phi + arm * Math.PI / 2 + Math.PI * 0.12;
+      const sc = 900 + r * 0.04;
+      const hot = Math.random() < 0.25;
+      add(r * Math.cos(th) + gauss() * sc, r * Math.sin(th) + gauss() * sc, gauss() * 300, hot ? 0.75 : 0.62, hot ? 0.85 : 0.7, 1.0);
+    }
+  }
+  for (let k = 0; k < 14000; k++) { // diffuse disc, exponential scale length ~10,000 ly
+    const r = -Math.log(1 - Math.random() * 0.995) * 10000, th = Math.random() * 2 * Math.PI;
+    add(r * Math.cos(th), r * Math.sin(th), gauss() * 500, 0.55, 0.58, 0.7);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  var galaxy = new THREE.Points(g, new THREE.PointsMaterial({ size: 1.4, sizeAttenuation: false, vertexColors: true, map: dotTex, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
+  galaxy.frustumCulled = false;
+  deep.add(galaxy);
+  deepLabel('Galactic centre <small>Sagittarius A*, a 4-million-solar-mass black hole</small>', GC_SCENE, 2e13, 1e16);
+  deepLabel('Milky Way <small>schematic model · ~100,000 light-years across</small>', galToScene(R0_LY - 30000, 42000, 0), 4e13, 1e16);
+  deepLabel('You are here <small>the Sun, ~26,700 light-years from the centre</small>', new THREE.Vector3(), 2e12, 1e16);
+}
+
+function updateDeep(t, cd) {
+  const on = $('layer-labels').checked;
+  for (const [l, min, max] of deepLabels) l.visible = on && cd > min && cd < max;
+  for (const b of smallBodies) {
+    const M = b.ma + b.n * (t - b.epoch) / 86400000;
+    eclToScene(keplerEcl(b.a, b.e, b.i, b.om, b.w, M), b.marker.position);
+    b.orbit.visible = $('layer-orbits').checked && cd > 2e5 && cd < 2e9;
+    b.marker.visible = cd > 2e5 && cd < 2e9;
+    b.label.visible = on && cd > 5e5 && cd < (b.a > 200 ? 3e8 : 8e7);
+  }
+  kuiper.visible = cd > 2e5 && cd < 2e9;
+  helio.visible = cd > 4.5e6 && cd < 8e9; // only once the camera is well outside the heliopause
+  oort.visible = cd > 4e7 && cd < 1e12;
+  nearStars.visible = cd > 1e9 && cd < 2e13;
+  galaxy.material.opacity = THREE.MathUtils.smoothstep(Math.log10(cd), 11.5, 13);
+  galaxy.visible = galaxy.material.opacity > 0.01;
+  // The catalogue sky is "at infinity" for the solar system; at galactic scale it gives way to the model.
+  const skyFade = 1 - THREE.MathUtils.smoothstep(Math.log10(cd), 11.5, 12.8);
+  for (const p of sky.children) p.material.opacity = skyFade;
+  sky.visible = skyFade > 0.01;
+  // Planet orbits and labels belong to solar-system scales.
+  for (const p of PLANETS) {
+    p.orbit.visible = p.orbit.visible && cd < 3e8;
+    if (p.label) p.label.visible = p.label.visible && cd < 6e7;
+  }
+}
+
+// -------------------------------------------------------------- cinematic
+// A slow guided tour through the real scene. Every caption number is read
+// from the live data at that moment; nothing is staged.
+const terminatorView = () => new THREE.Vector3().crossVectors(sunDir, new THREE.Vector3(0, 1, 0)).normalize()
+  .multiplyScalar(0.9).addScaledVector(sunDir, -0.3).add(new THREE.Vector3(0, 0.4, 0)).normalize();
+const fmtKm = (km) => Math.round(km).toLocaleString();
+const SHOTS = [
+  { scale: 1.1, dir: terminatorView, hold: 12, cap: () => `${(catalog ? visible.reduce((a, b) => a + b, 0) : 0).toLocaleString()} satellites, positioned from CelesTrak orbit data. Sunlit ones shine; those in Earth’s shadow go dark.` },
+  { follow: '25544', scale: 0.45, hold: 13, cap: () => {
+    const i = catalog?.ids.indexOf('25544') ?? -1;
+    if (i < 0) return 'The International Space Station.';
+    const p = new THREE.Vector3(); satPos(i, p);
+    return `The International Space Station, ${fmtKm(p.length() * RE_KM - RE_KM)} km up at ${selVel.length().toFixed(2)} km/s: one lap of Earth every ${catalog.periods[i].toFixed(1)} minutes.`;
+  } },
+  { scale: 3, dir: () => new THREE.Vector3(0.6, 0.45, 0.66).normalize(), hold: 10, cap: () => 'The geostationary belt, 35,786 km up. Satellites here circle once a day, keeping pace with Earth’s spin.' },
+  { scale: 4, hold: 11, cap: () => `The Moon, ${fmtKm(moon.position.length() * RE_KM)} km away right now. Its phase is what the real Sun is lighting.` },
+  { scale: 5, hold: 12, cap: () => {
+    const l = windStatus.latest;
+    return l ? `1.5 million km sunward, spacecraft at L1 measure the solar wind: ${Math.round(l.v)} km/s, reaching Earth in about ${Math.round(L1_KM / l.v / 60)} minutes.` : 'Sun–Earth L1, 1.5 million km sunward, where the solar wind is measured before it reaches Earth.';
+  } },
+  { scale: 6, hold: 12, cap: () => 'Mercury, Venus, Earth and Mars where they are today, with Parker Solar Probe, Solar Orbiter and BepiColombo near the Sun.' },
+  { scale: 7, hold: 11, cap: () => 'The giant planets. Europa Clipper, JUICE, Lucy and Psyche are on their way out to them.' },
+  { scale: 8, hold: 11, cap: () => {
+    const v1 = probes.find((p) => p.name === 'Voyager 1');
+    if (!v1 || !v1.distKm) return 'Voyager 1 and 2, in interstellar space.';
+    return `Voyager 1, ${(v1.distKm / 1.496e8).toFixed(1)} AU from Earth, beyond the heliopause. Its radio signal takes ${(v1.distKm / 299792.458 / 3600).toFixed(1)} hours to reach us.`;
+  } },
+  { scale: 9, hold: 11, cap: () => 'The Oort cloud, a theorised shell of icy bodies up to 100,000 AU out. No spacecraft has reached it, and none has seen it.' },
+  { scale: 10, hold: 12, cap: () => 'The nearest stars at their real distances. Proxima Centauri is 4.25 light-years away: about 73,000 years at Voyager 1’s speed.' },
+  { scale: 11, hold: 14, cap: () => 'The Milky Way, about 100,000 light-years across. We are ~26,700 light-years from its centre (the spiral arms here are a model).' },
+];
+const cine = { on: false, i: -1, t: 0 };
+function startCinematic() {
+  cine.on = true; cine.i = -1; cine.t = 0;
+  document.body.classList.add('cinematic');
+  $('cine').hidden = false;
+  controls.autoRotate = true;
+  controls.autoRotateSpeed = 0.35;
+  nextShot();
+}
+function stopCinematic() {
+  cine.on = false;
+  document.body.classList.remove('cinematic');
+  $('cine').hidden = true;
+  controls.autoRotate = false;
+  following = false;
+  $('sel-follow').classList.remove('active');
+}
+function nextShot() {
+  cine.i = (cine.i + 1) % SHOTS.length;
+  cine.t = 0;
+  const shot = SHOTS[cine.i];
+  if (shot.follow) {
+    const i = catalog?.ids.indexOf(shot.follow) ?? -1;
+    if (i >= 0) { select(i); following = true; }
+  } else if (following) { following = false; select(-1); }
+  setScaleValue(shot.scale);
+  if (shot.dir) { camDir.copy(shot.dir()); flyDir = true; }
+  const cap = $('cine-cap');
+  cap.classList.remove('show');
+  setTimeout(() => { cap.textContent = shot.cap(); cap.classList.add('show'); }, 900);
+}
+function updateCinematic(dt) {
+  if (!cine.on) return;
+  cine.t += dt;
+  if (cine.t > SHOTS[cine.i].hold) nextShot();
+}
+setInterval(() => { if (cine.on && cine.t > 1) $('cine-cap').textContent = SHOTS[cine.i].cap(); }, 1000);
+$('cine-btn').onclick = () => (cine.on ? stopCinematic() : startCinematic());
+$('cine-exit').onclick = stopCinematic;
+$('cine-next').onclick = nextShot;
+addEventListener('keydown', (e) => { if (e.key === 'Escape' && cine.on) stopCinematic(); });
+
+// ------------------------------------------------------------------- loop
+const clock = $('clock');
+let lastFrame = performance.now();
+let lastBodies = 0;
+function frame(tNow) {
+  const dt = Math.min((tNow - lastFrame) / 1000, 0.1);
+  lastFrame = tNow;
+  const now = Date.now();
+  const sim = updateSimTime(dt);
+  updateBodies(sim);
+  updateMoonOrbit(sim);
+  updateSatellites(sim);
+  updateCinematic(dt);
+  updateCamera(dt);
+  updateProbes(sim, camera.position.distanceTo(controls.target));
+  updateDeep(sim, camera.position.distanceTo(controls.target));
+  updateWind(dt, now);
+  controls.update();
+  if (glowOn) composer.render(); else renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  labelRenderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+setInterval(() => { renderTimeUi(); renderSelection(); renderFreshness(); renderWeather(); }, 500);
+
+updateBodies(Date.now());
+setScaleValue(1);
+renderIss();
+pollCatalog(); setInterval(pollCatalog, 10 * 60000);
+pollWeather(); setInterval(pollWeather, 60000);
+pollAurora(); setInterval(pollAurora, 5 * 60000);
+startIssTelemetry();
+requestAnimationFrame(frame);

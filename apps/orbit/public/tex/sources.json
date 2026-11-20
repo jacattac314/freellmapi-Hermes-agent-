@@ -1,0 +1,7 @@
+{
+  "earth-day.jpg": "NASA Blue Marble: Next Generation (GIBS layer BlueMarble_NextGeneration), 4096x2048 equirectangular",
+  "earth-night.jpg": "NASA Black Marble 2016, VIIRS Day/Night Band (GIBS layer VIIRS_Black_Marble), 4096x2048",
+  "earth-clouds.jpg": "Cloud mask extracted from NASA GIBS VIIRS NOAA-20 Corrected Reflectance True Color, 2026-11-19 (gaps filled from 2026-11-18)",
+  "clouds_date": "2026-11-19",
+  "moon.jpg": "NASA SVS CGI Moon Kit (LRO LROC colour mosaic), 1024x512"
+}

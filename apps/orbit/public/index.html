@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Orbit — live satellites &amp; space weather</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/vendor/three/build/three.module.js",
+        "three/addons/": "/vendor/three/examples/jsm/"
+      }
+    }
+  </script>
+  <script src="/vendor/topojson-client/dist/topojson-client.min.js"></script>
+</head>
+<body>
+  <div id="scene"></div>
+
+  <div id="demo-banner" hidden>DEMO DATA — synthetic, not real observations</div>
+
+  <header id="topbar">
+    <div class="brand">Orbit</div>
+    <div id="clock" class="mono"></div>
+    <div id="sat-count" class="muted"></div>
+    <button id="cine-btn" title="Guided cinematic tour">Cinematic</button>
+    <button id="toggle-left" class="mobile-only" aria-controls="left">Filters</button>
+    <button id="toggle-right" class="mobile-only" aria-controls="right">Data</button>
+  </header>
+
+  <!-- Left: filters + search -->
+  <aside id="left" class="panel">
+    <section>
+      <h3>Find</h3>
+      <input id="search" type="search" placeholder="ISS, Starlink-1007, GPS…" autocomplete="off" />
+      <label><input type="checkbox" id="only-matches" /> Show only matches on the globe</label>
+      <ul id="search-results"></ul>
+      <div id="filter-count" class="muted"></div>
+    </section>
+    <section>
+      <h3>Orbit regime</h3>
+      <label><input type="checkbox" data-regime="LEO" checked /> <span class="sw" style="--c:var(--leo)"></span>Low Earth (LEO)</label>
+      <label><input type="checkbox" data-regime="MEO" checked /> <span class="sw" style="--c:var(--meo)"></span>Medium (MEO)</label>
+      <label><input type="checkbox" data-regime="GEO" checked /> <span class="sw" style="--c:var(--geo)"></span>Geostationary (GEO)</label>
+      <label><input type="checkbox" data-regime="HEO" checked /> <span class="sw" style="--c:var(--heo)"></span>Highly elliptical</label>
+    </section>
+    <section>
+      <h3>Type <span class="hint"><button class="link" id="types-all">all</button> · <button class="link" id="types-none">none</button></span></h3>
+      <div id="type-list"></div>
+    </section>
+    <section>
+      <h3>Altitude</h3>
+      <div id="alt-label" class="mono"></div>
+      <div class="alt-range">
+        <input id="alt-min" type="range" min="0" max="12" step="1" value="0" aria-label="Minimum altitude" />
+        <input id="alt-max" type="range" min="0" max="12" step="1" value="12" aria-label="Maximum altitude" />
+      </div>
+      <div class="muted small">Shows objects whose orbit passes through this band.</div>
+    </section>
+    <section>
+      <h3>Layers</h3>
+      <label><input type="checkbox" id="layer-aurora" checked /> Aurora forecast</label>
+      <label><input type="checkbox" id="layer-wind" checked /> Solar wind &amp; magnetopause</label>
+      <label class="select-row">Wind animation
+        <select id="wind-speed">
+          <option value="1">real speed</option>
+          <option value="60" selected>60× faster</option>
+          <option value="600">600× faster</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="layer-orbits" checked /> Orbit paths</label>
+      <label><input type="checkbox" id="layer-probes" checked /> Deep-space probes</label>
+      <div id="probe-count" class="muted small"></div>
+      <label><input type="checkbox" id="layer-glow" /> Glow</label>
+      <label><input type="checkbox" id="layer-rings" checked /> GEO ring</label>
+      <label><input type="checkbox" id="layer-labels" checked /> Labels</label>
+    </section>
+  </aside>
+
+  <!-- Right: space weather + ISS telemetry + selection -->
+  <aside id="right" class="panel">
+    <section id="selection" hidden>
+      <h3 id="sel-name"></h3>
+      <dl id="sel-body"></dl>
+      <div class="row">
+        <button id="sel-follow">Follow</button>
+        <button id="sel-clear">Close</button>
+      </div>
+    </section>
+    <section>
+      <h3>Space weather <span class="hint">NOAA SWPC</span></h3>
+      <dl id="wx"></dl>
+    </section>
+    <section>
+      <h3>ISS live telemetry <span class="hint">NASA ISSLive</span></h3>
+      <div id="iss-signal" class="muted">connecting…</div>
+      <dl id="iss-tm"></dl>
+    </section>
+    <section>
+      <h3>Data freshness</h3>
+      <dl id="freshness"></dl>
+    </section>
+  </aside>
+
+  <!-- Bottom: scale slider -->
+  <footer id="scale" class="panel">
+    <div class="scale-head">
+      <div id="scale-title"></div>
+      <div id="time-ctl" role="group" aria-label="Time controls">
+        <button id="t-rev" title="Slower, then backwards">◀◀</button>
+        <button id="t-play" title="Pause">❚❚</button>
+        <button id="t-fwd" title="Faster">▶▶</button>
+        <span id="t-rate" class="mono">Live</span>
+        <button id="t-now" class="active" title="Glide back to the present">Now</button>
+      </div>
+    </div>
+    <div class="timeline">
+      <input id="t-scrub" type="range" min="-1000" max="1000" step="1" value="0" aria-label="Time, one year either side of now" />
+      <div class="timeline-ticks"><span style="left:0%">−1 yr</span><span style="left:28.2%">−1 mo</span><span style="left:50%">now</span><span style="left:71.8%">+1 mo</span><span style="left:100%">+1 yr</span></div>
+    </div>
+    <input id="scale-slider" type="range" min="0" max="5" step="0.001" value="1" aria-label="View scale" />
+    <div id="scale-ticks"></div>
+    <div id="scale-desc" class="muted"></div>
+  </footer>
+
+  <div id="tooltip" hidden></div>
+
+  <div id="cine" hidden>
+    <p id="cine-cap"></p>
+    <div class="cine-bar">
+      <span class="muted small">Real positions and measurements · captions update live</span>
+      <button id="cine-next">Next</button>
+      <button id="cine-exit">Exit</button>
+    </div>
+  </div>
+
+  <script type="module" src="/main.js"></script>
+</body>
+</html>

@@ -12,7 +12,9 @@
     "test": "npm run test -w @freellmapi/api",
     "setup": "npm run build -w @freellmapi/shared && DATABASE_URL=file:./apps/api/dev.db npx prisma db push --schema=apps/api/prisma/schema.prisma --skip-generate",
     "db:push": "DATABASE_URL=file:./apps/api/dev.db npx prisma db push --schema=apps/api/prisma/schema.prisma",
-    "db:studio": "DATABASE_URL=file:./apps/api/dev.db npx prisma studio --schema=apps/api/prisma/schema.prisma"
+    "db:studio": "DATABASE_URL=file:./apps/api/dev.db npx prisma studio --schema=apps/api/prisma/schema.prisma",
+    "orbit": "npm run start -w @freellmapi/orbit",
+    "orbit:demo": "DEMO=1 npm run start -w @freellmapi/orbit"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

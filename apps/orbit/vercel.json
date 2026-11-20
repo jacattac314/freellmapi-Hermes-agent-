@@ -1,0 +1,18 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "true",
+  "buildCommand": "node build-vercel.mjs",
+  "outputDirectory": "dist/vercel",
+  "functions": {
+    "api/feed/[key].js": {
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/data/:key",
+      "destination": "/api/feed/:key"
+    }
+  ]
+}

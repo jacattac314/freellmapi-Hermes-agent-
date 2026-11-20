@@ -44,3 +44,6 @@ coverage/
 
 # Vite
 apps/dashboard/.vite/
+
+# Orbit data cache
+apps/orbit/.cache/
