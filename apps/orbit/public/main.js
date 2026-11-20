@@ -37,13 +37,13 @@ container.appendChild(labelRenderer.domElement);
 
 const scene = new THREE.Scene();
 renderer.toneMapping = THREE.NoToneMapping;
-const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.001, 1e9);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.001, 1e16);
 camera.position.set(2.2, 1.6, 2.6);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.minDistance = 1.15;
-controls.maxDistance = 2e7;
+controls.maxDistance = 5e14;
 controls.enablePan = false;
 
 // Soft glow on genuinely bright things (the Sun, sunlit satellites, glint,
@@ -1013,9 +1013,12 @@ const STOPS = [
   { name: 'Sun–Earth L1', dist: 800, desc: '1.5 million km sunward: ACE and DSCOVR measure the solar wind here. The stream shows the last hour of those measurements on its way to Earth, coloured by speed.' },
   { name: 'Inner solar system', dist: 1.3e5, desc: 'Mercury, Venus, Earth and Mars where they are today, from NASA JPL orbital elements. Earth is 1 AU (150 million km) from the Sun; light takes 8 minutes to cross it.' },
   { name: 'Outer solar system', dist: 2.4e6, desc: 'Jupiter to Neptune, with the probes heading out. Neptune is 30 AU away, over 4 light-hours. Try 30 d/s to watch the inner planets lap the outer ones.' },
-  { name: 'Interstellar', dist: 2e7, desc: 'Voyager 1 (~177 AU) and Voyager 2 (~148 AU) have left the Sun’s bubble of solar wind. A radio signal from Voyager 1 takes about a day to reach us.' },
+  { name: 'Voyagers & the heliosphere', dist: 2.2e7, desc: 'The heliopause, ~120 AU out, is where the solar wind meets interstellar space. Voyager 1 crossed it in 2012 and Voyager 2 in 2018. Pluto, Eris and the other dwarf planets are on real JPL orbits; Sedna’s reaches ~1,000 AU.' },
+  { name: 'Oort cloud', dist: 7e9, desc: 'A theorised shell of icy bodies 2,000–100,000 AU out, thought to send us long-period comets. It has never been observed directly; the points are an impression, not data.' },
+  { name: 'Nearest stars', dist: 9e10, desc: 'Our stellar neighbours at their measured distances: Proxima Centauri 4.25 light-years, Barnard’s Star 6, Sirius 8.6. Voyager 1 would take ~73,000 years to cover Proxima’s distance.' },
+  { name: 'Milky Way', dist: 2.8e14, desc: 'Our galaxy, ~100,000 light-years across (schematic arms). The Sun sits ~26,700 light-years from the centre and takes ~230 million years to go round once.' },
 ];
-STOPS.forEach((st, i) => { st.short = ['Surface', 'LEO', 'Nav sats', 'GEO', 'Moon', 'L1', 'Inner', 'Outer', 'Voyagers'][i]; });
+STOPS.forEach((st, i) => { st.short = ['Surface', 'LEO', 'Nav', 'GEO', 'Moon', 'L1', 'Inner', 'Outer', 'Helio', 'Oort', 'Stars', 'Galaxy'][i]; });
 const slider = $('scale-slider');
 slider.max = String(STOPS.length - 1);
 $('scale-ticks').innerHTML = STOPS.map((s, i) => `<span data-i="${i}" style="left:${(i / (STOPS.length - 1)) * 100}%">${s.short}</span>`).join('');
@@ -1042,7 +1045,12 @@ const ECL_NORTH = new THREE.Vector3(0, Math.cos(OBLIQ), Math.sin(OBLIQ));
 function setScaleValue(v) {
   slider.value = String(v); targetDist = scaleToDist(v); updateScaleText(v);
   if (following) return;
-  if (v >= 5.5 && viewMode !== 'ecliptic') {
+  if (v >= 10.5 && viewMode !== 'galaxy') {
+    // Galaxy: look down from above the galactic plane at a slant.
+    viewMode = 'galaxy';
+    camDir.copy(NGP_SCENE).multiplyScalar(0.8).addScaledVector(GC_SCENE.clone().normalize(), -0.6).normalize();
+    flyDir = true;
+  } else if (v >= 5.5 && v < 10.5 && viewMode !== 'ecliptic') {
     // Solar system: look down on the ecliptic at a slant so orbits read as ellipses.
     viewMode = 'ecliptic';
     camDir.crossVectors(sunDir, ECL_NORTH).normalize().multiplyScalar(0.55).addScaledVector(ECL_NORTH, 0.85).normalize();
@@ -1085,7 +1093,8 @@ function updateCamera(dt) {
   }
   // Centre on Earth up to L1, then glide to the Sun for the planets.
   const scale = targetDist !== null ? Number(slider.value) : distToScale(dist);
-  wantTarget.copy(sunScene).multiplyScalar(THREE.MathUtils.smoothstep(scale, 5.15, 6));
+  wantTarget.copy(sunScene).multiplyScalar(THREE.MathUtils.smoothstep(scale, 5.15, 6))
+    .addScaledVector(GC_SCENE, THREE.MathUtils.smoothstep(scale, 10.1, 11));
   controls.target.lerp(wantTarget, 1 - Math.exp(-dt * 5));
   camera.position.copy(controls.target).addScaledVector(dir, dist);
   sky.position.copy(camera.position);
@@ -1101,9 +1110,9 @@ function updateLabelVisibility(dist = camera.position.length()) {
   const on = $('layer-labels').checked;
   issLabel.visible = on && dist < 30;
   moonLabel.visible = on && dist > 25 && dist < 5000;
-  earthLabel.visible = on && dist > 60;
+  earthLabel.visible = on && dist > 60 && dist < 3e8;
   l1Label.visible = on && dist > 80 && dist < 5000;
-  sunLabel.visible = on && dist > 80;
+  sunLabel.visible = on && dist > 80 && dist < 2e9;
   for (const p of PLANETS) {
     if (p.label) p.label.visible = on && dist > 3000;
     p.orbit.visible = dist > 3000; // closer in they only cut across the view as straight lines
@@ -1482,6 +1491,222 @@ function windRows() {
   return rows;
 }
 
+// ------------------------------------------------------------- deep space
+// Beyond the planets, everything below is heliocentric (inside solarGroup).
+// Measured: dwarf planets / comets (JPL elements), nearest stars (parallax
+// distances), Voyager heliopause crossings. Modelled, and labelled as such:
+// heliosphere shape, Oort cloud, Kuiper Belt particles, Milky Way structure.
+const LY_RE = 9.4607e12 / RE_KM;
+const deep = new THREE.Group();
+solarGroup.add(deep);
+const deepLabels = []; // [label, minDist, maxDist]
+function deepLabel(html, pos, min, max, parent = deep) {
+  const l = makeLabel(html);
+  l.position.copy(pos);
+  parent.add(l);
+  deepLabels.push([l, min, max]);
+  return l;
+}
+function cloudPoints(positions, colour, size, opacity) {
+  const g = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  const p = new THREE.Points(g, new THREE.PointsMaterial({ color: colour, size, sizeAttenuation: false, map: dotTex, transparent: true, opacity, depthWrite: false, blending: THREE.AdditiveBlending }));
+  p.frustumCulled = false;
+  deep.add(p);
+  return p;
+}
+const gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+// Two-body Kepler position from elements (AU, degrees) → ecliptic J2000, AU.
+function keplerEcl(a, e, i, om, w, Mdeg) {
+  const M = ((Mdeg % 360) + 360) % 360 * D2R;
+  let E = e < 0.8 ? M : Math.PI;
+  for (let k = 0; k < 30; k++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+  const xp = a * (Math.cos(E) - e), yp = a * Math.sqrt(1 - e * e) * Math.sin(E);
+  const W = w * D2R, O = om * D2R, I = i * D2R;
+  const cw = Math.cos(W), sw = Math.sin(W), cO = Math.cos(O), sO = Math.sin(O), cI = Math.cos(I), sI = Math.sin(I);
+  return {
+    x: (cw * cO - sw * sO * cI) * xp + (-sw * cO - cw * sO * cI) * yp,
+    y: (cw * sO + sw * cO * cI) * xp + (-sw * sO + cw * cO * cI) * yp,
+    z: sw * sI * xp + cw * sI * yp,
+  };
+}
+
+// Dwarf planets, Sedna, Arrokoth, Halley's Comet (public/smallbodies.json).
+const smallBodies = [];
+fetch('/smallbodies.json').then((r) => r.json()).then(({ bodies }) => {
+  for (const b of bodies) {
+    const pts = [];
+    for (let k = 0; k <= 720; k++) {
+      // sample by eccentric anomaly so long, thin orbits stay smooth
+      const E = (k / 720) * 2 * Math.PI, M = (E - b.e * Math.sin(E)) / D2R;
+      pts.push(eclToScene(keplerEcl(b.a, b.e, b.i, b.om, b.w, M)));
+    }
+    const orbit = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: b.name.startsWith('Halley') ? 0x9fd7ff : 0xb9a7ff, transparent: true, opacity: 0.35 }));
+    orbit.frustumCulled = false;
+    deep.add(orbit);
+    const marker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
+      new THREE.PointsMaterial({ color: 0xd8ccff, size: 5, sizeAttenuation: false, map: dotTex, alphaTest: 0.5, transparent: true }));
+    marker.frustumCulled = false;
+    const label = makeLabel(b.name);
+    label.element.title = b.note;
+    marker.add(label);
+    deep.add(marker);
+    smallBodies.push({ ...b, orbit, marker, label });
+  }
+}).catch((e) => console.warn('small bodies', e));
+
+// Kuiper Belt: a particle impression of the 30–50 AU region (not individual objects).
+{
+  const pos = [];
+  for (let k = 0; k < 5000; k++) {
+    const r = k % 3 ? 42 + gauss() * 2.5 : 30 + Math.random() * 20;   // "classical" belt near 42–47 AU
+    const lon = Math.random() * 2 * Math.PI, lat = gauss() * (k % 3 ? 2.5 : 8) * D2R;
+    pos.push(...eclToScene({ x: r * Math.cos(lat) * Math.cos(lon), y: r * Math.cos(lat) * Math.sin(lon), z: r * Math.sin(lat) }).toArray());
+  }
+  var kuiper = cloudPoints(pos, 0x8fa3c8, 1.4, 0.45);
+  deepLabel('Kuiper Belt <small>30–50 AU · impression of the region</small>', eclToScene({ x: 0, y: -46, z: 0 }), 4e5, 6e7);
+}
+
+// Heliosphere. Nose points into the interstellar wind (from ecliptic longitude
+// 255.4°, latitude 5.2°). Distances anchored to the Voyager crossings:
+// termination shock 94 AU (V1, 2004) / 84 AU (V2, 2007); heliopause 121.6 AU
+// (V1, 2012) / 119 AU (V2, 2018). The flank and tail shape is a model.
+const NOSE = eclToScene({ x: Math.cos(5.2 * D2R) * Math.cos(255.4 * D2R), y: Math.cos(5.2 * D2R) * Math.sin(255.4 * D2R), z: Math.sin(5.2 * D2R) }).normalize();
+const helio = new THREE.Group();
+helio.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), NOSE);
+deep.add(helio);
+function helioShell(rNose, stretch, maxDeg, colour, opacity) {
+  const pts = [];
+  for (let d = 0; d <= maxDeg; d += 6) {
+    const t = d * D2R, r = rNose * (1 + stretch * (1 - Math.cos(t)));
+    pts.push(new THREE.Vector2(r * Math.sin(t) * AU_RE, r * Math.cos(t) * AU_RE));
+  }
+  const g = new THREE.LatheGeometry(pts, 32);
+  helio.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: opacity * 0.4, side: THREE.DoubleSide, depthWrite: false })));
+  helio.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: opacity * 0.7, wireframe: true, depthWrite: false })));
+}
+helioShell(90, 0.45, 180, 0x6fa8ff, 0.035);   // termination shock
+helioShell(121, 1.1, 150, 0x9f8cff, 0.03);    // heliopause (open tail)
+deepLabel('Heliopause <small>edge of the Sun’s bubble · ~120 AU at the nose</small>', NOSE.clone().multiplyScalar(125 * AU_RE), 2e6, 3e9);
+deepLabel('Termination shock <small>solar wind slows abruptly · 84–94 AU</small>', NOSE.clone().multiplyScalar(-150 * AU_RE), 3e6, 1.5e8);
+
+// Oort cloud: theorised shell of icy bodies, 2,000–100,000 AU (never observed directly).
+{
+  const pos = [];
+  for (let k = 0; k < 9000; k++) {
+    const r = Math.exp(Math.log(2000) + Math.random() * Math.log(50)) * AU_RE;
+    const v = new THREE.Vector3().randomDirection().multiplyScalar(r);
+    pos.push(v.x, v.y, v.z);
+  }
+  var oort = cloudPoints(pos, 0x9fb7d9, 1.3, 0.35);
+  deepLabel('Oort cloud <small>theorised · 2,000–100,000 AU · source of long-period comets</small>', new THREE.Vector3(0, 60000 * AU_RE, 0), 4e8, 2e11);
+}
+
+// Nearest stars at their measured distances (RA/Dec J2000 degrees, light-years).
+const NEAR_STARS = [
+  ['Proxima Centauri', 217.429, -62.680, 4.25, 0xff9a6a], ['Alpha Centauri A & B', 219.900, -60.835, 4.37, 0xfff1d6],
+  ["Barnard's Star", 269.452, 4.693, 5.96, 0xff9a6a], ['Wolf 359', 164.120, 7.015, 7.86, 0xff8a5a],
+  ['Lalande 21185', 165.836, 35.970, 8.31, 0xffa76a], ['Sirius', 101.287, -16.716, 8.60, 0xcfe0ff],
+  ['Luyten 726-8', 24.750, -17.950, 8.73, 0xff8a5a], ['Ross 154', 282.455, -23.836, 9.70, 0xff9a6a],
+  ['Ross 248', 355.479, 44.178, 10.3, 0xff8a5a], ['Epsilon Eridani', 53.233, -9.458, 10.5, 0xffd2a0],
+  ['Lacaille 9352', 346.467, -35.853, 10.7, 0xffa76a], ['Ross 128', 176.935, 0.804, 11.0, 0xff9a6a],
+  ['61 Cygni', 316.725, 38.749, 11.4, 0xffc48a], ['Procyon', 114.825, 5.225, 11.5, 0xfff6e8],
+  ['Epsilon Indi', 330.840, -56.786, 11.9, 0xffc48a], ['Tau Ceti', 26.017, -15.938, 11.9, 0xffe6c0],
+  ["Teegarden's Star", 43.254, 16.881, 12.5, 0xff7a4a], ["Kapteyn's Star", 77.919, -45.018, 12.8, 0xffa76a],
+  ['Altair', 297.696, 8.868, 16.7, 0xf4f7ff], ['Vega', 279.235, 38.784, 25.0, 0xdfe8ff],
+  ['Fomalhaut', 344.413, -29.622, 25.1, 0xeef3ff], ['Arcturus', 213.915, 19.182, 36.7, 0xffc98a],
+];
+const nearStars = new THREE.Group();
+deep.add(nearStars);
+for (const [name, ra, dec, ly, colour] of NEAR_STARS) {
+  const pos = raDecToVec(ra, dec, ly * LY_RE);
+  const m = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(pos.toArray(), 3)),
+    new THREE.PointsMaterial({ color: colour, size: ly < 13 ? 6 : 7, sizeAttenuation: false, map: dotTex, transparent: true, depthWrite: false }));
+  m.frustumCulled = false;
+  nearStars.add(m);
+  deepLabel(`${name}<small>${ly} light-years</small>`, pos, 2e9, 4e11, nearStars);
+}
+deepLabel('The Sun', new THREE.Vector3(), 2e9, 2e12);
+
+// Milky Way: schematic model (bulge, bar, four trailing log-spiral arms, disc).
+// Real: its orientation (galactic coordinates → J2000) and the Sun's place,
+// ~26,700 ly from the centre, between the Sagittarius and Perseus arms.
+const R0_LY = 26670;
+const GAL_TO_EQ = [[-0.0548755604, -0.8734370902, -0.4838350155], [0.4941094279, -0.4448296300, 0.7469822445], [-0.8676661490, -0.1980763734, 0.4559837762]];
+function galToScene(x, y, z, out = new THREE.Vector3()) { // galactic (Sun-centred, ly) → scene
+  const ex = x * GAL_TO_EQ[0][0] + y * GAL_TO_EQ[1][0] + z * GAL_TO_EQ[2][0];
+  const ey = x * GAL_TO_EQ[0][1] + y * GAL_TO_EQ[1][1] + z * GAL_TO_EQ[2][1];
+  const ez = x * GAL_TO_EQ[0][2] + y * GAL_TO_EQ[1][2] + z * GAL_TO_EQ[2][2];
+  return out.set(ex, ez, -ey).multiplyScalar(LY_RE);
+}
+const GC_SCENE = galToScene(R0_LY, 0, 0);
+const NGP_SCENE = galToScene(0, 0, 1).normalize();
+{
+  const pos = [], col = [];
+  const add = (gx, gy, gz, r, g, b) => { // gx,gy,gz relative to the galactic centre
+    const v = galToScene(R0_LY + gx, gy, gz);
+    pos.push(v.x, v.y, v.z); col.push(r * 0.22, g * 0.22, b * 0.22);
+  };
+  const barAngle = 27 * D2R;
+  for (let k = 0; k < 6000; k++) { // bulge + bar
+    const t = gauss() * 9000, w = gauss() * 2600;
+    add(-(t * Math.cos(barAngle) - w * Math.sin(barAngle)), t * Math.sin(barAngle) + w * Math.cos(barAngle), gauss() * 900, 1.0, 0.82, 0.55);
+  }
+  const b = Math.tan(12 * D2R);
+  for (let arm = 0; arm < 4; arm++) {
+    for (let k = 0; k < 9000; k++) {
+      const phi = Math.random() * 1.75 * Math.PI;
+      const r = 10500 * Math.exp(b * phi);
+      if (r > 52000) continue;
+      const th = phi + arm * Math.PI / 2 + Math.PI * 0.12;
+      const sc = 900 + r * 0.04;
+      const hot = Math.random() < 0.25;
+      add(r * Math.cos(th) + gauss() * sc, r * Math.sin(th) + gauss() * sc, gauss() * 300, hot ? 0.75 : 0.62, hot ? 0.85 : 0.7, 1.0);
+    }
+  }
+  for (let k = 0; k < 14000; k++) { // diffuse disc, exponential scale length ~10,000 ly
+    const r = -Math.log(1 - Math.random() * 0.995) * 10000, th = Math.random() * 2 * Math.PI;
+    add(r * Math.cos(th), r * Math.sin(th), gauss() * 500, 0.55, 0.58, 0.7);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  var galaxy = new THREE.Points(g, new THREE.PointsMaterial({ size: 1.4, sizeAttenuation: false, vertexColors: true, map: dotTex, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
+  galaxy.frustumCulled = false;
+  deep.add(galaxy);
+  deepLabel('Galactic centre <small>Sagittarius A*, a 4-million-solar-mass black hole</small>', GC_SCENE, 2e13, 1e16);
+  deepLabel('Milky Way <small>schematic model · ~100,000 light-years across</small>', galToScene(R0_LY - 30000, 42000, 0), 4e13, 1e16);
+  deepLabel('You are here <small>the Sun, ~26,700 light-years from the centre</small>', new THREE.Vector3(), 2e12, 1e16);
+}
+
+function updateDeep(t, cd) {
+  const on = $('layer-labels').checked;
+  for (const [l, min, max] of deepLabels) l.visible = on && cd > min && cd < max;
+  for (const b of smallBodies) {
+    const M = b.ma + b.n * (t - b.epoch) / 86400000;
+    eclToScene(keplerEcl(b.a, b.e, b.i, b.om, b.w, M), b.marker.position);
+    b.orbit.visible = $('layer-orbits').checked && cd > 2e5 && cd < 2e9;
+    b.marker.visible = cd > 2e5 && cd < 2e9;
+    b.label.visible = on && cd > 5e5 && cd < (b.a > 200 ? 3e8 : 8e7);
+  }
+  kuiper.visible = cd > 2e5 && cd < 2e9;
+  helio.visible = cd > 4.5e6 && cd < 8e9; // only once the camera is well outside the heliopause
+  oort.visible = cd > 4e7 && cd < 1e12;
+  nearStars.visible = cd > 1e9 && cd < 2e13;
+  galaxy.material.opacity = THREE.MathUtils.smoothstep(Math.log10(cd), 11.5, 13);
+  galaxy.visible = galaxy.material.opacity > 0.01;
+  // The catalogue sky is "at infinity" for the solar system; at galactic scale it gives way to the model.
+  const skyFade = 1 - THREE.MathUtils.smoothstep(Math.log10(cd), 11.5, 12.8);
+  for (const p of sky.children) p.material.opacity = skyFade;
+  sky.visible = skyFade > 0.01;
+  // Planet orbits and labels belong to solar-system scales.
+  for (const p of PLANETS) {
+    p.orbit.visible = p.orbit.visible && cd < 3e8;
+    if (p.label) p.label.visible = p.label.visible && cd < 6e7;
+  }
+}
+
 // -------------------------------------------------------------- cinematic
 // A slow guided tour through the real scene. Every caption number is read
 // from the live data at that moment; nothing is staged.
@@ -1507,8 +1732,11 @@ const SHOTS = [
   { scale: 8, hold: 11, cap: () => {
     const v1 = probes.find((p) => p.name === 'Voyager 1');
     if (!v1 || !v1.distKm) return 'Voyager 1 and 2, in interstellar space.';
-    return `Voyager 1, ${(v1.distKm / 1.496e8).toFixed(1)} AU from Earth. Its radio signal takes ${(v1.distKm / 299792.458 / 3600).toFixed(1)} hours to reach us.`;
+    return `Voyager 1, ${(v1.distKm / 1.496e8).toFixed(1)} AU from Earth, beyond the heliopause. Its radio signal takes ${(v1.distKm / 299792.458 / 3600).toFixed(1)} hours to reach us.`;
   } },
+  { scale: 9, hold: 11, cap: () => 'The Oort cloud, a theorised shell of icy bodies up to 100,000 AU out. No spacecraft has reached it, and none has seen it.' },
+  { scale: 10, hold: 12, cap: () => 'The nearest stars at their real distances. Proxima Centauri is 4.25 light-years away: about 73,000 years at Voyager 1’s speed.' },
+  { scale: 11, hold: 14, cap: () => 'The Milky Way, about 100,000 light-years across. We are ~26,700 light-years from its centre (the spiral arms here are a model).' },
 ];
 const cine = { on: false, i: -1, t: 0 };
 function startCinematic() {
@@ -1567,6 +1795,7 @@ function frame(tNow) {
   updateCinematic(dt);
   updateCamera(dt);
   updateProbes(sim, camera.position.distanceTo(controls.target));
+  updateDeep(sim, camera.position.distanceTo(controls.target));
   updateWind(dt, now);
   controls.update();
   if (glowOn) composer.render(); else renderer.render(scene, camera);

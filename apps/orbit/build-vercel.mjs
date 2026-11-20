@@ -46,6 +46,7 @@ const files = {
   'sat-worker.js': worker,
   'stars.json': read('public/stars.json'),
   'probes.json': read('public/probes.json'),
+  'smallbodies.json': read('public/smallbodies.json'),
 };
 fs.rmSync(out, { recursive: true, force: true });
 for (const [name, body] of Object.entries(files)) {
