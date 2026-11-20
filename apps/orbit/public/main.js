@@ -1,6 +1,10 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { gstime } from '/vendor/satellite.js/dist/propagation.js';
 import { eciToGeodetic } from '/vendor/satellite.js/dist/transforms.js';
 
@@ -32,6 +36,7 @@ Object.assign(labelRenderer.domElement.style, { position: 'absolute', top: '0', 
 container.appendChild(labelRenderer.domElement);
 
 const scene = new THREE.Scene();
+renderer.toneMapping = THREE.NoToneMapping;
 const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.001, 1e9);
 camera.position.set(2.2, 1.6, 2.6);
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -40,6 +45,15 @@ controls.dampingFactor = 0.08;
 controls.minDistance = 1.15;
 controls.maxDistance = 2e7;
 controls.enablePan = false;
+
+// Soft glow on genuinely bright things (the Sun, sunlit satellites, glint,
+// aurora). On by default on larger screens; phones keep it off for battery.
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.6, 0.55, 0.8);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+let glowOn = innerWidth > 820;
 
 scene.add(new THREE.AmbientLight(0x334466, 0.35));
 const sunLight = new THREE.DirectionalLight(0xffffff, 2.2);
@@ -96,13 +110,96 @@ const earth = new THREE.Mesh(
 );
 earthGroup.add(earth);
 
-// Atmosphere rim glow
+// Shared world-space Sun direction for the custom shaders.
+const sunUniform = { value: new THREE.Vector3(1, 0, 0) };
+const LOGDEPTH_V = '#include <common>\n#include <logdepthbuf_pars_vertex>\n';
+const LOGDEPTH_F = '#include <common>\n#include <logdepthbuf_pars_fragment>\n';
+
+// NASA imagery: Blue Marble (day), Black Marble city lights (night), real clouds
+// from VIIRS (yesterday), lit by the true Sun. The day/night line, twilight band,
+// city lights and ocean glint all follow the real terminator at the viewed time.
+const texLoader = new THREE.TextureLoader();
+function loadTex(url) {
+  return new Promise((resolve, reject) => texLoader.load(url, (t) => {
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    resolve(t);
+  }, undefined, reject));
+}
+const earthShader = new THREE.ShaderMaterial({
+  uniforms: { dayTex: { value: null }, nightTex: { value: null }, cloudTex: { value: null }, sunDir: sunUniform },
+  vertexShader: LOGDEPTH_V + `
+    varying vec2 vUv; varying vec3 vN; varying vec3 vP;
+    void main() {
+      vUv = uv;
+      vN = normalize(mat3(modelMatrix) * normal);
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vP = wp.xyz;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+      #include <logdepthbuf_vertex>
+    }`,
+  fragmentShader: LOGDEPTH_F + `
+    uniform sampler2D dayTex, nightTex, cloudTex; uniform vec3 sunDir;
+    varying vec2 vUv; varying vec3 vN; varying vec3 vP;
+    void main() {
+      #include <logdepthbuf_fragment>
+      vec3 n = normalize(vN);
+      float mu = dot(n, sunDir);                         // cos(solar zenith angle)
+      float day = smoothstep(-0.10, 0.10, mu);          // ~±6°: civil twilight width
+      vec3 albedo = texture2D(dayTex, vUv).rgb;
+      float cloud = texture2D(cloudTex, vUv).r;
+      vec3 surf = mix(albedo, vec3(0.95), cloud);
+      vec3 col = surf * (0.03 + 1.1 * max(mu, 0.0));
+      // Sun glint on open ocean (Blue Marble oceans are dark and blue-dominant).
+      float ocean = smoothstep(0.02, 0.0, albedo.r - albedo.b * 0.55) * (1.0 - cloud);
+      vec3 v = normalize(cameraPosition - vP);
+      float spec = pow(max(dot(reflect(-sunDir, n), v), 0.0), 60.0) * ocean * day;
+      col += vec3(1.0, 0.92, 0.8) * spec * 0.9;
+      // Low sun is reddened by the long path through the air: tint, don't add.
+      float low = exp(-mu * mu * 260.0) * step(-0.02, mu);
+      col *= mix(vec3(1.0), vec3(1.35, 0.78, 0.5), low * 0.7);
+      // City lights on the night side, dimmed by cloud.
+      vec3 night = texture2D(nightTex, vUv).rgb;
+      float lights = max(0.0, max(night.r, night.g) - 0.16) * 2.2;
+      col += vec3(1.0, 0.78, 0.45) * lights * (1.0 - day) * (1.0 - cloud * 0.75);
+      gl_FragColor = vec4(col, 1.0);
+      #include <colorspace_fragment>
+    }`,
+});
+Promise.all(['tex/earth-day.jpg', 'tex/earth-night.jpg', 'tex/earth-clouds.jpg'].map(loadTex)).then(([d, n, c]) => {
+  earthShader.uniforms.dayTex.value = d;
+  earthShader.uniforms.nightTex.value = n;
+  earthShader.uniforms.cloudTex.value = c;
+  earth.material = earthShader;
+  document.body.classList.add('imagery');
+  coastMaterial.opacity = 0.18; // the imagery already shows the coasts
+  gratMaterial.opacity = 0.08;
+}).catch((e) => console.warn('earth imagery', e));
+
+// Atmosphere: a thin limb that is blue where sunlit, reddens along the
+// terminator and fades out on the night side (an approximation of Rayleigh
+// scattering; the layer is drawn ~1.5% of Earth's radius thick).
 scene.add(new THREE.Mesh(
-  new THREE.SphereGeometry(1.03, 64, 48),
+  new THREE.SphereGeometry(1.025, 96, 64),
   new THREE.ShaderMaterial({
     side: THREE.BackSide, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
-    vertexShader: 'varying vec3 vN; varying vec3 vV; void main(){ vec4 mv = modelViewMatrix*vec4(position,1.0); vN = normalize(normalMatrix*normal); vV = normalize(-mv.xyz); gl_Position = projectionMatrix*mv; }',
-    fragmentShader: 'varying vec3 vN; varying vec3 vV; void main(){ float f = pow(1.0 - abs(dot(vN, vV)), 3.0); gl_FragColor = vec4(0.3,0.6,1.0,1.0)*f*0.9; }',
+    uniforms: { sunDir: sunUniform },
+    vertexShader: LOGDEPTH_V + `varying vec3 vN; varying vec3 vP;
+      void main() { vN = normalize(mat3(modelMatrix) * normal); vec4 wp = modelMatrix * vec4(position, 1.0); vP = wp.xyz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+        #include <logdepthbuf_vertex>
+      }`,
+    fragmentShader: LOGDEPTH_F + `uniform vec3 sunDir; varying vec3 vN; varying vec3 vP;
+      void main() {
+        #include <logdepthbuf_fragment>
+        vec3 n = normalize(vN), v = normalize(cameraPosition - vP);
+        float rim = pow(1.0 - abs(dot(n, v)), 2.6);
+        float mu = dot(n, sunDir);
+        float lit = smoothstep(-0.35, 0.25, mu);
+        vec3 c = mix(vec3(1.0, 0.42, 0.12), vec3(0.32, 0.62, 1.0), smoothstep(-0.05, 0.45, mu));
+        gl_FragColor = vec4(c * rim * lit * 1.25, 1.0);
+        #include <colorspace_fragment>
+      }`,
   }),
 ));
 
@@ -112,13 +209,15 @@ function lonLatToVec(lon, lat, r = 1) {
   return new THREE.Vector3(r * Math.cos(la) * Math.cos(lo), r * Math.sin(la), -r * Math.cos(la) * Math.sin(lo));
 }
 
+const gratMaterial = new THREE.LineBasicMaterial({ color: 0x1d4a7a, transparent: true, opacity: 0.35 });
+const coastMaterial = new THREE.LineBasicMaterial({ color: 0x5fb3ea, transparent: true, opacity: 0.75 });
 // Graticule
 {
   const pts = [];
   for (let lat = -60; lat <= 60; lat += 30) for (let lon = 0; lon < 360; lon += 2) pts.push(lonLatToVec(lon, lat, 1.001), lonLatToVec(lon + 2, lat, 1.001));
   for (let lon = 0; lon < 360; lon += 30) for (let lat = -88; lat < 88; lat += 2) pts.push(lonLatToVec(lon, lat, 1.001), lonLatToVec(lon, lat + 2, 1.001));
   earthGroup.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
-    new THREE.LineBasicMaterial({ color: 0x1d4a7a, transparent: true, opacity: 0.35 })));
+    gratMaterial));
 }
 
 // Coastlines (Natural Earth 110m via world-atlas)
@@ -129,7 +228,7 @@ fetch('/vendor/world-atlas/land-110m.json').then((r) => r.json()).then((topo) =>
     for (let i = 0; i < line.length - 1; i++) pts.push(lonLatToVec(...line[i], 1.0015), lonLatToVec(...line[i + 1], 1.0015));
   }
   earthGroup.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts),
-    new THREE.LineBasicMaterial({ color: 0x5fb3ea, transparent: true, opacity: 0.75 })));
+    coastMaterial));
 }).catch((e) => console.warn('coastlines', e));
 
 // GEO ring
@@ -150,7 +249,8 @@ function makeLabel(html) {
 }
 
 // Moon
-const moon = new THREE.Mesh(new THREE.SphereGeometry(1737.4 / RE_KM, 48, 32), new THREE.MeshPhongMaterial({ color: 0x9a9a9a }));
+const moon = new THREE.Mesh(new THREE.SphereGeometry(1737.4 / RE_KM, 64, 48), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, metalness: 0 }));
+loadTex('tex/moon.jpg').then((t) => { moon.material.map = t; moon.material.needsUpdate = true; }).catch(() => {});
 const moonLabel = makeLabel('Moon');
 moon.add(moonLabel);
 const moonMarker = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3)),
@@ -286,6 +386,7 @@ function updateBodies(now) {
   sunScene.copy(earthHelio).negate();
   solarGroup.position.copy(sunScene);
   sunDir.copy(sunScene).normalize();
+  sunUniform.value.copy(sunDir);
   for (const p of PLANETS) if (p.obj) eclToScene(planetHelio(p, T), p.obj.position);
   sunLight.position.copy(sunDir).multiplyScalar(50);
   l1.position.copy(sunDir).multiplyScalar(L1_R);
@@ -302,7 +403,33 @@ let catalog = null; // { ids, names, regimes, groups, periods, epochs, dead }
 let N = 0;
 let satGeom = null, satPoints = null, posAttr = null;
 let visible = new Uint8Array(0);
-const satMat = new THREE.PointsMaterial({ size: 3, sizeAttenuation: false, vertexColors: true, map: dotTex, alphaTest: 0.05, transparent: true });
+// Satellites shine only when sunlit: a satellite behind Earth (relative to the
+// Sun) and within one Earth radius of the Sun–Earth axis is in shadow.
+const satMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, vertexColors: true,
+  uniforms: { size: { value: 3 }, opacity: { value: 1 }, pixelRatio: { value: renderer.getPixelRatio() }, sunDir: sunUniform },
+  vertexShader: LOGDEPTH_V + `
+    uniform float size, pixelRatio; uniform vec3 sunDir; varying vec3 vCol; varying float vLit;
+    void main() {
+      vCol = color;
+      float along = dot(position, sunDir);
+      float perp = length(position - along * sunDir);
+      vLit = (along < 0.0 && perp < 1.0) ? 0.0 : 1.0;
+      gl_PointSize = size * pixelRatio * (vLit > 0.5 ? 1.0 : 0.85);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      #include <logdepthbuf_vertex>
+    }`,
+  fragmentShader: LOGDEPTH_F + `
+    uniform float opacity; varying vec3 vCol; varying float vLit;
+    void main() {
+      #include <logdepthbuf_fragment>
+      vec2 d = gl_PointCoord - 0.5; float r = length(d);
+      if (r > 0.5) discard;
+      vec3 c = mix(vCol * 0.22, vCol * 1.15, vLit);   // in shadow: a faint ember, not gone
+      gl_FragColor = vec4(c, opacity * smoothstep(0.5, 0.35, r));
+      #include <colorspace_fragment>
+    }`,
+});
 
 const selMarker = new THREE.Points(
   new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(3), 3)),
@@ -550,6 +677,8 @@ function showPanel(side) {
 $('toggle-left').onclick = () => showPanel('left');
 $('toggle-right').onclick = () => showPanel('right');
 
+$('layer-glow').checked = glowOn;
+$('layer-glow').addEventListener('change', (e) => { glowOn = e.target.checked; });
 $('layer-rings').addEventListener('change', (e) => { geoRing.visible = e.target.checked; });
 $('layer-labels').addEventListener('change', () => updateLabelVisibility());
 
@@ -686,7 +815,7 @@ function updateSimTime(dt) {
   // Satellites fade out while gliding or when out of range, and back in when settled.
   const want = satsAllowed() && !gliding ? 1 : 0;
   satsAlpha += (want - satsAlpha) * (1 - Math.exp(-dt * 6));
-  satMat.opacity = satsAlpha;
+  satMat.uniforms.opacity.value = satsAlpha;
   const show = satsAlpha > 0.02;
   if (satPoints) satPoints.visible = show;
   for (const line of tracks.values()) line.visible = show && $('layer-orbits').checked && line.userData.ok;
@@ -963,7 +1092,7 @@ function updateCamera(dt) {
   if (targetDist === null) { slider.value = String(distToScale(dist)); updateScaleText(Number(slider.value)); }
 
   // Point size grows a touch when zoomed in; selection/labels adapt to scale.
-  satMat.size = dist < 4 ? 3.2 : dist < 25 ? 2.6 : 2;
+  satMat.uniforms.size.value = dist < 4 ? 3.2 : dist < 25 ? 2.6 : 2;
   controls.rotateSpeed = dist > 50 ? 0.6 : 1;
   updateLabelVisibility(dist);
 }
@@ -987,7 +1116,7 @@ function updateLabelVisibility(dist = camera.position.length()) {
 
 // ------------------------------------------------------------ aurora layer
 const auroraPoints = new THREE.Points(new THREE.BufferGeometry(), new THREE.PointsMaterial({
-  size: 0.03, vertexColors: true, transparent: true, opacity: 0.85, depthWrite: false, blending: THREE.AdditiveBlending, map: dotTex,
+  size: 0.026, vertexColors: true, transparent: true, opacity: 0.55, depthWrite: false, blending: THREE.AdditiveBlending, map: dotTex,
 }));
 earthGroup.add(auroraPoints);
 $('layer-aurora').addEventListener('change', () => updateLabelVisibility());
@@ -1269,7 +1398,8 @@ function updateWind(dt, now) {
   const latest = windSeries[windSeries.length - 1];
   const on = $('layer-wind').checked && !!latest;
   windPoints.visible = on;
-  mpGroup.visible = on && camera.position.distanceTo(controls.target) < 100; // clutter beyond GEO scale
+  const cd = camera.position.distanceTo(controls.target);
+  mpGroup.visible = on && cd > mp.r0 * 1.15 && cd < 100; // only from outside the shell, up to Moon scale
   if (!on) return;
   windStatus = windTimeline(now);
   const arriving = windStatus.arriving;
@@ -1352,6 +1482,76 @@ function windRows() {
   return rows;
 }
 
+// -------------------------------------------------------------- cinematic
+// A slow guided tour through the real scene. Every caption number is read
+// from the live data at that moment; nothing is staged.
+const terminatorView = () => new THREE.Vector3().crossVectors(sunDir, new THREE.Vector3(0, 1, 0)).normalize()
+  .multiplyScalar(0.9).addScaledVector(sunDir, -0.3).add(new THREE.Vector3(0, 0.4, 0)).normalize();
+const fmtKm = (km) => Math.round(km).toLocaleString();
+const SHOTS = [
+  { scale: 1.1, dir: terminatorView, hold: 12, cap: () => `${(catalog ? visible.reduce((a, b) => a + b, 0) : 0).toLocaleString()} satellites, positioned from CelesTrak orbit data. Sunlit ones shine; those in Earth’s shadow go dark.` },
+  { follow: '25544', scale: 0.45, hold: 13, cap: () => {
+    const i = catalog?.ids.indexOf('25544') ?? -1;
+    if (i < 0) return 'The International Space Station.';
+    const p = new THREE.Vector3(); satPos(i, p);
+    return `The International Space Station, ${fmtKm(p.length() * RE_KM - RE_KM)} km up at ${selVel.length().toFixed(2)} km/s: one lap of Earth every ${catalog.periods[i].toFixed(1)} minutes.`;
+  } },
+  { scale: 3, dir: () => new THREE.Vector3(0.6, 0.45, 0.66).normalize(), hold: 10, cap: () => 'The geostationary belt, 35,786 km up. Satellites here circle once a day, keeping pace with Earth’s spin.' },
+  { scale: 4, hold: 11, cap: () => `The Moon, ${fmtKm(moon.position.length() * RE_KM)} km away right now. Its phase is what the real Sun is lighting.` },
+  { scale: 5, hold: 12, cap: () => {
+    const l = windStatus.latest;
+    return l ? `1.5 million km sunward, spacecraft at L1 measure the solar wind: ${Math.round(l.v)} km/s, reaching Earth in about ${Math.round(L1_KM / l.v / 60)} minutes.` : 'Sun–Earth L1, 1.5 million km sunward, where the solar wind is measured before it reaches Earth.';
+  } },
+  { scale: 6, hold: 12, cap: () => 'Mercury, Venus, Earth and Mars where they are today, with Parker Solar Probe, Solar Orbiter and BepiColombo near the Sun.' },
+  { scale: 7, hold: 11, cap: () => 'The giant planets. Europa Clipper, JUICE, Lucy and Psyche are on their way out to them.' },
+  { scale: 8, hold: 11, cap: () => {
+    const v1 = probes.find((p) => p.name === 'Voyager 1');
+    if (!v1 || !v1.distKm) return 'Voyager 1 and 2, in interstellar space.';
+    return `Voyager 1, ${(v1.distKm / 1.496e8).toFixed(1)} AU from Earth. Its radio signal takes ${(v1.distKm / 299792.458 / 3600).toFixed(1)} hours to reach us.`;
+  } },
+];
+const cine = { on: false, i: -1, t: 0 };
+function startCinematic() {
+  cine.on = true; cine.i = -1; cine.t = 0;
+  document.body.classList.add('cinematic');
+  $('cine').hidden = false;
+  controls.autoRotate = true;
+  controls.autoRotateSpeed = 0.35;
+  nextShot();
+}
+function stopCinematic() {
+  cine.on = false;
+  document.body.classList.remove('cinematic');
+  $('cine').hidden = true;
+  controls.autoRotate = false;
+  following = false;
+  $('sel-follow').classList.remove('active');
+}
+function nextShot() {
+  cine.i = (cine.i + 1) % SHOTS.length;
+  cine.t = 0;
+  const shot = SHOTS[cine.i];
+  if (shot.follow) {
+    const i = catalog?.ids.indexOf(shot.follow) ?? -1;
+    if (i >= 0) { select(i); following = true; }
+  } else if (following) { following = false; select(-1); }
+  setScaleValue(shot.scale);
+  if (shot.dir) { camDir.copy(shot.dir()); flyDir = true; }
+  const cap = $('cine-cap');
+  cap.classList.remove('show');
+  setTimeout(() => { cap.textContent = shot.cap(); cap.classList.add('show'); }, 900);
+}
+function updateCinematic(dt) {
+  if (!cine.on) return;
+  cine.t += dt;
+  if (cine.t > SHOTS[cine.i].hold) nextShot();
+}
+setInterval(() => { if (cine.on && cine.t > 1) $('cine-cap').textContent = SHOTS[cine.i].cap(); }, 1000);
+$('cine-btn').onclick = () => (cine.on ? stopCinematic() : startCinematic());
+$('cine-exit').onclick = stopCinematic;
+$('cine-next').onclick = nextShot;
+addEventListener('keydown', (e) => { if (e.key === 'Escape' && cine.on) stopCinematic(); });
+
 // ------------------------------------------------------------------- loop
 const clock = $('clock');
 let lastFrame = performance.now();
@@ -1364,11 +1564,12 @@ function frame(tNow) {
   updateBodies(sim);
   updateMoonOrbit(sim);
   updateSatellites(sim);
+  updateCinematic(dt);
   updateCamera(dt);
   updateProbes(sim, camera.position.distanceTo(controls.target));
   updateWind(dt, now);
   controls.update();
-  renderer.render(scene, camera);
+  if (glowOn) composer.render(); else renderer.render(scene, camera);
   labelRenderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
@@ -1378,6 +1579,7 @@ addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
   labelRenderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
 });
 
 setInterval(() => { renderTimeUi(); renderSelection(); renderFreshness(); renderWeather(); }, 500);

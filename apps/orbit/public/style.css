@@ -148,3 +148,26 @@ button.link { background: none; border: none; padding: 0; color: var(--accent); 
   #clock { font-size: 11px; line-height: 1.25; }
   #clock .rate { display: block; margin-left: 0; font-size: 10px; }
 }
+
+/* ---------- cinematic mode ---------- */
+#cine-btn { flex: none; padding: 3px 10px; }
+body.cinematic #left, body.cinematic #right, body.cinematic #scale, body.cinematic #tooltip { display: none !important; }
+body.cinematic #topbar { opacity: 0.35; transition: opacity 0.4s; }
+body.cinematic #topbar:hover { opacity: 1; }
+body.cinematic::before, body.cinematic::after {
+  content: ""; position: fixed; left: 0; right: 0; height: 9vh; background: #000; z-index: 4; pointer-events: none;
+}
+body.cinematic::before { top: 0; }
+body.cinematic::after { bottom: 0; }
+#cine {
+  position: fixed; left: 50%; transform: translateX(-50%); z-index: 6; text-align: center;
+  bottom: calc(9vh + 14px + env(safe-area-inset-bottom, 0px)); width: min(760px, calc(100vw - 32px));
+}
+#cine-cap {
+  margin: 0 0 10px; font-size: clamp(15px, 2.1vw, 22px); line-height: 1.4; color: #fff; font-weight: 400;
+  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.9); opacity: 0; transition: opacity 0.9s ease; text-wrap: balance;
+}
+#cine-cap.show { opacity: 1; }
+.cine-bar { display: flex; gap: 8px; justify-content: center; align-items: center; flex-wrap: wrap; }
+.cine-bar button { flex: none; padding: 3px 12px; }
+@media (prefers-reduced-motion: reduce) { #cine-cap { transition: none; } }

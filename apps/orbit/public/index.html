@@ -24,6 +24,7 @@
     <div class="brand">Orbit</div>
     <div id="clock" class="mono"></div>
     <div id="sat-count" class="muted"></div>
+    <button id="cine-btn" title="Guided cinematic tour">Cinematic</button>
     <button id="toggle-left" class="mobile-only" aria-controls="left">Filters</button>
     <button id="toggle-right" class="mobile-only" aria-controls="right">Data</button>
   </header>
@@ -71,6 +72,7 @@
       <label><input type="checkbox" id="layer-orbits" checked /> Orbit paths</label>
       <label><input type="checkbox" id="layer-probes" checked /> Deep-space probes</label>
       <div id="probe-count" class="muted small"></div>
+      <label><input type="checkbox" id="layer-glow" /> Glow</label>
       <label><input type="checkbox" id="layer-rings" checked /> GEO ring</label>
       <label><input type="checkbox" id="layer-labels" checked /> Labels</label>
     </section>
@@ -123,6 +125,15 @@
   </footer>
 
   <div id="tooltip" hidden></div>
+
+  <div id="cine" hidden>
+    <p id="cine-cap"></p>
+    <div class="cine-bar">
+      <span class="muted small">Real positions and measurements · captions update live</span>
+      <button id="cine-next">Next</button>
+      <button id="cine-exit">Exit</button>
+    </div>
+  </div>
 
   <script type="module" src="/main.js"></script>
 </body>

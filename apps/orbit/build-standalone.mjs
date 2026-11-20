@@ -124,4 +124,9 @@ ${main}
 
 fs.mkdirSync(path.dirname(out), { recursive: true });
 fs.writeFileSync(out, page);
+// NASA imagery is published beside the page (images can't be inlined sensibly).
+fs.mkdirSync(path.join(path.dirname(out), 'tex'), { recursive: true });
+for (const f of fs.readdirSync(path.join(dir, 'public', 'tex'))) {
+  fs.copyFileSync(path.join(dir, 'public', 'tex', f), path.join(path.dirname(out), 'tex', f));
+}
 console.log(`wrote ${out} (${(page.length / 1024).toFixed(0)} KB)`);

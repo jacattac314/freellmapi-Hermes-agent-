@@ -53,4 +53,6 @@ for (const [name, body] of Object.entries(files)) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, body);
 }
-console.log(`wrote ${Object.keys(files).length} files to ${out}`);
+fs.mkdirSync(path.join(out, 'tex'), { recursive: true });
+for (const f of fs.readdirSync(path.join(dir, 'public', 'tex'))) fs.copyFileSync(path.join(dir, 'public', 'tex', f), path.join(out, 'tex', f));
+console.log(`wrote ${Object.keys(files).length} files + tex/ to ${out}`);
