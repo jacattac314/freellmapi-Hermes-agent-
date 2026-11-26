@@ -1,0 +1,1 @@
+{ "name": "file-tree", "version": "0.1.0", "description": "A pane showing the files Claude has read, written and edited, as a tree", "types": "./types/index.d.ts" }

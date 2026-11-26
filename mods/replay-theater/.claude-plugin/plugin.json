@@ -1,0 +1,1 @@
+{ "name": "replay-theater", "version": "0.1.0", "description": "Step through every file edit Claude made this session", "types": "./types/index.d.ts" }

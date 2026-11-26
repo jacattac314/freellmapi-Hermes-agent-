@@ -1,0 +1,1 @@
+{ "name": "cache-tax", "version": "0.1.0", "description": "Prompt-cache hit rate and estimated cache cost per turn", "types": "./types/index.d.ts" }
