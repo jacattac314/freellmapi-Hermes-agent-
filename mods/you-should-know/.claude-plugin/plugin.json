@@ -1,0 +1,1 @@
+{ "name": "you-should-know", "version": "0.1.0", "description": "A second model reads each answer and flags anything critical you might miss", "types": "./types/index.d.ts" }

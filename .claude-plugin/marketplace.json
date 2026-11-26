@@ -1,0 +1,48 @@
+{
+  "name": "hermes-mods",
+  "owner": {
+    "name": "jacattac314"
+  },
+  "plugins": [
+    {
+      "name": "blast-radius",
+      "source": "./mods/blast-radius",
+      "description": "Asks for confirmation before high-risk shell commands"
+    },
+    {
+      "name": "cache-tax",
+      "source": "./mods/cache-tax",
+      "description": "Prompt-cache hit rate and estimated cache cost per turn"
+    },
+    {
+      "name": "file-tree",
+      "source": "./mods/file-tree",
+      "description": "A pane showing the files Claude has read, written and edited, as a tree"
+    },
+    {
+      "name": "reflect",
+      "source": "./mods/reflect",
+      "description": "Save feedback as standing rules that Claude follows in every session (/reflect)"
+    },
+    {
+      "name": "replay-theater",
+      "source": "./mods/replay-theater",
+      "description": "Step through every file edit Claude made this session"
+    },
+    {
+      "name": "savvy-progress",
+      "source": "./mods/savvy-progress",
+      "description": "Progress band and pane for subagents, tokens per model and session cost"
+    },
+    {
+      "name": "skins",
+      "source": "./mods/skins",
+      "description": "Switchable color themes for the desktop and mobile apps (/skin)"
+    },
+    {
+      "name": "you-should-know",
+      "source": "./mods/you-should-know",
+      "description": "A second model reads each answer and flags anything critical you might miss"
+    }
+  ]
+}

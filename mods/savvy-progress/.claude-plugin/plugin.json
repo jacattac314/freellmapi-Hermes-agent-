@@ -1,0 +1,1 @@
+{ "name": "savvy-progress", "version": "0.1.0", "description": "Progress band and pane for subagents, tokens per model and session cost", "types": "./types/index.d.ts" }
